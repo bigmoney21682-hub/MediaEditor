@@ -1,5 +1,7 @@
 # MediaEditor
 
+**[Open the app →](https://bigmoney21682-hub.github.io/MediaEditor/)**
+
 A layered photo editor that runs entirely in the browser, installable as a PWA and usable offline.
 
 Open a photo, edit it with crop / brush / shapes / text / stacked images, run an **age transform**
