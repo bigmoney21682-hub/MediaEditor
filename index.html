@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+<meta name="theme-color" content="#0f1115" />
+<meta name="description" content="MediaEditor — layered photo editing, drawing, shapes, text, age transform and multi-format export. Works offline." />
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+<title>MediaEditor</title>
+</head>
+<body>
+<div id="app">
+  <header class="topbar">
+    <div class="brand"><span class="dot"></span> MediaEditor</div>
+    <div class="topbar-actions">
+      <button id="btn-open" class="btn">Open</button>
+      <button id="btn-undo" class="btn icon" title="Undo (⌘Z)" disabled>↶</button>
+      <button id="btn-redo" class="btn icon" title="Redo (⇧⌘Z)" disabled>↷</button>
+      <span class="spacer"></span>
+      <button id="btn-age" class="btn accent">Age&nbsp;Transform</button>
+      <button id="btn-export" class="btn primary">Export</button>
+      <button id="btn-menu" class="btn icon only-narrow" title="Panels">☰</button>
+    </div>
+  </header>
+
+  <div class="body">
+    <nav class="tools" id="tools" aria-label="Tools">
+      <button class="tool" data-tool="select" title="Move / transform (V)"><span>⤧</span><em>Move</em></button>
+      <button class="tool" data-tool="crop" title="Crop (C)"><span>⛶</span><em>Crop</em></button>
+      <button class="tool" data-tool="draw" title="Brush (B)"><span>✎</span><em>Brush</em></button>
+      <button class="tool" data-tool="erase" title="Eraser (E)"><span>◻</span><em>Erase</em></button>
+      <button class="tool" data-tool="rect" title="Rectangle (R)"><span>▭</span><em>Rect</em></button>
+      <button class="tool" data-tool="ellipse" title="Ellipse (O)"><span>◯</span><em>Ellipse</em></button>
+      <button class="tool" data-tool="line" title="Line / arrow (L)"><span>╱</span><em>Line</em></button>
+      <button class="tool" data-tool="text" title="Text (T)"><span>T</span><em>Text</em></button>
+      <button class="tool" data-tool="place" title="Place image (I)"><span>🖼</span><em>Image</em></button>
+    </nav>
+
+    <main class="stage" id="stage">
+      <canvas id="canvas"></canvas>
+      <div class="dropzone" id="dropzone">
+        <div class="dz-inner">
+          <div class="dz-icon">🖼</div>
+          <h2>Drop a photo to start</h2>
+          <p>or <button class="link" id="dz-browse">browse your files</button> · paste with ⌘V</p>
+          <p class="muted">Everything runs on your device. Nothing is uploaded.</p>
+        </div>
+      </div>
+      <div class="zoombar">
+        <button class="btn icon" id="zoom-out" title="Zoom out">−</button>
+        <button class="btn" id="zoom-fit" title="Fit to screen">Fit</button>
+        <span id="zoom-label">100%</span>
+        <button class="btn icon" id="zoom-in" title="Zoom in">+</button>
+      </div>
+      <div class="crop-actions" id="crop-actions" hidden>
+        <button class="btn" id="crop-cancel">Cancel</button>
+        <button class="btn primary" id="crop-apply">Apply crop</button>
+      </div>
+    </main>
+
+    <aside class="panels" id="panels" aria-label="Options">
+      <section class="panel" id="panel-options">
+        <h3>Tool</h3>
+        <div id="tool-options"></div>
+      </section>
+      <section class="panel grow">
+        <h3>Layers <button class="btn tiny" id="btn-add-layer" title="New blank layer">+</button></h3>
+        <ul class="layers" id="layers"></ul>
+      </section>
+      <section class="panel" id="panel-layer">
+        <h3>Layer</h3>
+        <div id="layer-options"></div>
+      </section>
+    </aside>
+  </div>
+</div>
+
+<input type="file" id="file-input" accept="image/*" hidden />
+<input type="file" id="file-place" accept="image/*" hidden multiple />
+<div id="modal-root"></div>
+<div id="toasts"></div>
+
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>
