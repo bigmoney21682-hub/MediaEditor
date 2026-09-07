@@ -1,9 +1,17 @@
 # Shared model proxy
 
-A Cloudflare Worker that holds a **pool** of Google API keys server-side, so
-MediaEditor's age transform can be shared as a plain link instead of asking
-every visitor for a key of their own. When one key runs out of free quota the
-Worker rotates to the next, so the link does not go down at the first daily cap.
+A Cloudflare Worker doing two jobs for MediaEditor's age transform.
+
+**`/edit` — the free, keyless route.** Runs Stable Diffusion inpainting on
+Cloudflare's own AI binding, which authenticates as the account that deployed
+this Worker. There is no API key in this path at all: deploy it and the app
+works, within the account's free allowance of 10,000 neurons a day.
+
+**Everything else — the Google key pool.** Held server-side so a plain link
+works for a visitor with no key of their own. When one key runs out of quota
+the Worker rotates to the next, so the link does not go down at the first daily
+cap. Bear in mind that Google's free tier does not include image generation, so
+these keys need billing enabled to be any use for an age transform.
 
 It is the same Worker the Image, PCB and Schematic analyzers deploy, trimmed to
 one vendor. Those apps also route Groq as a fallback, which makes sense for a
@@ -35,6 +43,17 @@ and abuse, and you should set all of them:
 | Per-IP daily cap | `RATE_LIMIT` KV + `DAILY_CAP` | **off until you bind the KV namespace** |
 | Passphrase | `APP_TOKEN` secret | **off until you set it** |
 
+The cap covers `/edit` as well, and that is the one people will actually reach:
+it spends your Workers AI allowance rather than a key pool, so a published URL
+with no cap will exhaust the account's free neurons for the day rather than
+merely somebody's Gemini quota.
+
+Note that the counter fails **open**. KV's free plan allows a thousand writes a
+day across the whole account, and when that runs out an unhandled throw would
+turn every request into an empty 500 — a far worse outcome than a cap that
+stops counting for a while. So a write failure serves the request and stops
+reporting a cap it can no longer keep.
+
 The passphrase is optional because a public app cannot really keep one secret —
 it ships in the JavaScript bundle. Set it anyway if the proxy is for a team
 rather than the public. For a genuinely public deployment the origin allowlist
@@ -48,13 +67,21 @@ From this directory. `wrangler` needs a browser login the first time.
 npx wrangler login
 ```
 
-Set the key pool — a comma- or newline-separated list. Free keys are free, so
-several from different accounts is the cheapest way to multiply the quota
-behind a shared link:
+`/edit` needs no secret at all — the `[ai]` binding in `wrangler.toml` is the
+whole configuration, and `npx wrangler deploy` is enough to make the app work.
+
+The Google routes need a key pool, as a comma- or newline-separated list.
+Remember these must be keys on projects with billing enabled; a free key lists
+models happily and then refuses every image generation:
 
 ```sh
 npx wrangler secret put GEMINI_KEYS   # AIzaOne,AIzaTwo,AIzaThree
 ```
+
+The prompt reads from a terminal. It cannot read from a pipe-less non-TTY —
+running it through an agent's shell uploads an *empty* secret and reports
+success — so use a real terminal, or pipe the value in: `pbpaste | npx wrangler
+secret put GEMINI_KEYS`.
 
 Bind a KV namespace so the per-IP cap actually applies:
 
@@ -101,6 +128,20 @@ uploaded anything:
 shows no meter rather than an invented one. Every proxied response also carries
 the same figures as `X-Quota-Limit` / `-Used` / `-Remaining` / `-Reset` headers,
 listed in `Access-Control-Expose-Headers` so the browser may actually read them.
+
+## Why the model is what it is
+
+`/edit` runs `@cf/runwayml/stable-diffusion-v1-5-inpainting`, which is neither
+the newest nor the prettiest image model in the catalogue. It is the one that
+reads the pixels it is sent.
+
+`flux-2-klein-4b` is described as unifying generation and editing, accepts an
+image in its multipart body without complaint, and returns much better looking
+pictures. It also ignores the image: asked to add a green dot to a photograph
+of a face, it returned a green dot on a wall it had invented. Cloudflare's own
+catalogue lists its task as Text-to-Image. Inpainting takes an image and a mask
+and leaves everything outside the mask alone, which is what an age transform in
+a photo editor actually needs.
 
 ## How a request picks its key
 

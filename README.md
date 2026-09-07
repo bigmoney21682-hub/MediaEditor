@@ -59,37 +59,45 @@ excluded so they stay sharp.
 
 It is convincing, and it is a simulation: it will not predict how a *specific* person actually ages.
 
-**AI model (optional).** For photoreal output the app drives Google's Gemini image models through
-the same stack the Image Analysis, PCB Analyzer and Schematic Analyzer apps use —
-the same credential chain, the same model fallback, the same Cloudflare Worker proxy. Pick it under
-*Age Transform → Engine → AI model*.
+**AI model (optional).** For photoreal output there are two hosted backends, and one of them is free.
 
-It is never the default and never runs unattended: the first time you select it the dialog says
-where the photo would go and asks once, deliberately, before anything is uploaded. The preview pane
-always stays on-device; the model is only called when you press Apply, and Cancel becomes Stop while
-it is in flight.
+*Cloudflare Workers AI (the default).* The Worker in `worker/` runs Stable Diffusion inpainting on
+Cloudflare's own AI binding, which authenticates as the account that deployed it — **there is no API
+key anywhere in this path**, and the account's free daily allowance covers ordinary use. It takes the
+face crop and a mask of what may change, so the pixels outside the mask are mathematically
+untouched: same pose, same clothing, same background, every time. It is a 512px model and softer
+than a current one; that is the price of the only free image editing on offer.
 
-**Where a request goes**, in order — each step is only reached when the one before it cannot serve:
+*Google Gemini.* The same stack the Image Analysis, PCB Analyzer and Schematic Analyzer apps use —
+the same credential chain, the same model fallback, the same Worker. Better at holding a composition
+still, and **it needs a key from a project with billing enabled**: Google's free tier does not carry
+the image models at all, so a free key answers every transform with a quota error however new it is.
+
+Either way it is never the default engine and never runs unattended: the first time you select the
+AI engine the dialog says where the photo would go and asks once, deliberately, before anything is
+uploaded. The preview pane always stays on-device; the model is only called when you press Apply,
+and Cancel becomes Stop while it is in flight.
+
+**Where a Gemini request goes**, in order — each step only reached when the one before it cannot
+serve:
 
 | Credential | Route | Cost |
 | --- | --- | --- |
 | Your own Google key | browser → Google directly | nothing touches a server of ours |
-| Your proxy | your own deployment of `worker/` | your Cloudflare account |
+| Your Worker | your own deployment of `worker/` | your Cloudflare account |
 | The shared service | the Worker this repo ships | someone else's key pool and daily cap |
 
 Under that sits model fallback: if the chosen image model is retired, invisible to that key, or rate
 limited, the next best one the key can actually reach is tried instead. Six upstream calls is the
-ceiling, so a bad day surfaces as an error rather than half a minute of silent retrying. A key is
-free from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), and adding one both
-overrides the shared pool and extends it — if your key is spent, the chain falls through rather than
-stopping.
+ceiling, so a bad day surfaces as an error rather than half a minute of silent retrying.
 
 **What the model is allowed to touch.** The obvious integration sends the whole photo and puts what
 comes back on a layer, which is wrong for an editor: the model redraws every pixel, so the
 background shifts, the grain changes, and a portrait of two people ages both when you asked about
-one. So *Model sees → Face region* (the default) sends a padded crop around each detected face and
-composites the result back through a feathered mask — everything outside it is still your original
-file. *Whole photo* is there for the times the crop is the wrong unit, like a full-length shot.
+one. So *Model sees → Face region* (the default) sends a padded square crop around each detected face
+and composites the result back through a feathered mask — everything outside it is still your
+original file. *Whole photo* is there for the times the crop is the wrong unit, like a full-length
+shot.
 
 The **Strength** slider mixes the returned face over the original, so a result that overshoots is
 dialled back rather than re-rendered.
@@ -97,12 +105,20 @@ dialled back rather than re-rendered.
 If no face is found, drag a box around one on the Original. The on-device skin and colour passes
 still run (face-shape changes need landmarks), and the AI engine uses the box as its crop.
 
+### A note on FLUX
+
+Cloudflare lists `flux-2-klein-4b` as unifying "generation and editing", it accepts an input image in
+its multipart body without complaint, and its output is far better looking than the inpainting
+model's. It also ignores the image entirely. Asked to add a green dot to a photograph of a face, it
+returned a green dot on a wall it had invented; every "edit" it produced was text-to-image, and
+looked convincing only because the prompt described the input in words. Cloudflare's own catalogue
+calls its task Text-to-Image. If that changes, `worker/index.js` is the one file to edit.
+
 ### Running the shared proxy yourself
 
-`worker/` is a Cloudflare Worker holding a pool of Google keys server-side, so a plain link works for
-someone who has no key of their own. It is the analyzers' Worker trimmed to one vendor — Groq is a
-fine second opinion on a *description* of an image and no use here, since it has no image-output
-model. Deploy notes, the limits to set before publishing the URL, and what each refusal means are in
+`worker/` does two jobs: it runs the free Workers AI route on `/edit`, and it holds a pool of Google
+keys server-side so a plain link works for someone who has no key of their own. Deploy notes, the
+limits to set before publishing the URL, and what each refusal means are in
 [`worker/README.md`](worker/README.md). Put the URL it prints into `SHARED_PROXY_URL` at the top of
 `src/ai/proxy.js`.
 
@@ -166,6 +182,7 @@ src/
   ai/                   the analyzer apps' model stack, ported
     proxy.js            credential chain: your key, your proxy, the shared service
     gemini.js           image editing through generateContent, with friendly errors
+    workersai.js        the keyless route: worker//edit, Stable Diffusion inpainting
     fallback.js         model- and credential-level retry
     rank.js             which of a key's models can actually draw
     apikey.js           key hygiene and diagnosis

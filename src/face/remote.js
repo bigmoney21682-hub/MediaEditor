@@ -6,10 +6,16 @@
  * engine and consents to the upload, and every setting — keys included — lives
  * only in this browser.
  *
- * Three backends:
+ * Four backends:
+ *   cloudflare — the default. worker/'s /edit route runs FLUX.2 [klein] on
+ *                Cloudflare's Workers AI, which authenticates as the account
+ *                rather than a key: nothing to sign up for, nothing to paste,
+ *                and free within the account's daily allowance.
  *   gemini     — the stack the analyzer apps use: the viewer's own Google key
  *                first, then their proxy, then the shared Worker, with model
- *                and credential fallback under all of it. See ai/.
+ *                and credential fallback under all of it. Better at holding a
+ *                composition still, and it needs a key with billing enabled;
+ *                Google's free tier does not carry the image models at all.
  *   custom     — your own endpoint. POST {image, years, direction} -> {image}
  *   replicate  — api.replicate.com, directly or through a relay of your own
  *
@@ -20,12 +26,14 @@
 
 import { copyCanvas, clamp, loadImage } from '../util.js';
 import { aiAgeTransform } from './aiage.js';
+import { provider as geminiProvider } from '../ai/gemini.js';
+import { provider as cloudflareProvider } from '../ai/workersai.js';
 import { reachable, apiKeyStore, proxyStore, sharedProxyStore, usingProxy } from '../ai/proxy.js';
 
 const KEY = 'mediaeditor.ai';
 const KEY_CONSENT = 'me.ai.consent';
 
-const DEFAULTS = { provider: 'gemini', endpoint: '', token: '', model: '', proxy: '' };
+const DEFAULTS = { provider: 'cloudflare', endpoint: '', token: '', model: '', proxy: '' };
 
 export function getConfig() {
   try {
@@ -62,6 +70,9 @@ export const consent = {
 /** Whether the selected backend has everything it needs to run. */
 export function isConfigured() {
   const c = getConfig();
+  // Workers AI needs no key — only a Worker to run on, which the shared
+  // service is by default. So the app arrives configured.
+  if (c.provider === 'cloudflare') return usingProxy();
   if (c.provider === 'gemini') return reachable(apiKeyStore.get());
   if (c.provider === 'custom') return !!c.endpoint;
   if (c.provider === 'replicate') return !!c.token && !!c.model;
@@ -71,6 +82,11 @@ export function isConfigured() {
 /** One line for the dialog: what a request would actually use. */
 export function describeBackend() {
   const c = getConfig();
+  if (c.provider === 'cloudflare') {
+    if (proxyStore.get().url) return 'Workers AI, on your own Worker';
+    if (sharedProxyStore.get()) return 'Workers AI, through the shared service';
+    return 'nothing yet — turn the shared service on, or set your own Worker URL';
+  }
   if (c.provider === 'gemini') {
     if (apiKeyStore.get()) return 'Google, with your own key' + (usingProxy() ? ', falling back to the proxy' : '');
     if (proxyStore.get().url) return 'your proxy';
@@ -92,7 +108,10 @@ export function describeBackend() {
 export async function runAI(source, opts) {
   const cfg = getConfig();
 
-  if (cfg.provider === 'gemini') return aiAgeTransform(source, opts);
+  // Both generative backends share the crop-and-composite pipeline; they
+  // differ only in the call that turns one image into another.
+  if (cfg.provider === 'cloudflare') return aiAgeTransform(source, opts, cloudflareProvider);
+  if (cfg.provider === 'gemini') return aiAgeTransform(source, opts, geminiProvider);
 
   const image = source.toDataURL('image/jpeg', 0.94);
   const url =

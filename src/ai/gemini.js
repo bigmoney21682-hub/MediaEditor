@@ -332,3 +332,19 @@ export function editImage(input, { apiKey, model, signal, onStatus, onModel, onC
     }
   });
 }
+
+/** What aiage.js needs to know to drive this provider. */
+export const provider = {
+  id: 'gemini',
+  label: 'Gemini',
+  /** The image models render around 1024px; sending more is upload time spent
+   *  on detail that does not survive the round trip. */
+  sendMax: 1024,
+  /** It re-synthesises the whole frame it is given and takes its instructions
+   *  in prose, so there is no mask to send. */
+  needsMask: false,
+  /** A photograph is a quarter the size as JPEG, and the model reads it just
+   *  as well — the difference is upload time on a phone. */
+  sendMime: 'image/jpeg',
+  edit: editImage
+};

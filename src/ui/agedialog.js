@@ -396,7 +396,8 @@ export function openAISettings(onSaved = () => {}) {
     build(content) {
       const provider = el('select', {});
       for (const [v, label] of [
-        ['gemini', 'Google Gemini — shared with the analyzer apps'],
+        ['cloudflare', 'Cloudflare Workers AI — free, no key'],
+        ['gemini', 'Google Gemini — needs a key with billing'],
         ['custom', 'Custom endpoint'],
         ['replicate', 'Replicate'],
         ['none', 'Off — on-device only']
@@ -467,24 +468,39 @@ export function openAISettings(onSaved = () => {}) {
         }
       });
 
+      const cloudflare = el('div', {},
+        el('div', { class: 'note' },
+          'Runs FLUX.2 [klein] on Cloudflare Workers AI. There is no API key: the Worker authenticates as the Cloudflare account that deployed it, and the account\'s free daily allowance covers roughly eighty edits. Nothing to sign up for.'),
+        el('div', { class: 'hint', style: { marginTop: '6px' } },
+          'It re-synthesises the region it is given, and can drift — a different expression, different clothes. Keeping *Model sees* on Face region is what stops that reaching the rest of the photo.')
+      );
+
       const gemini = el('div', {},
         el('div', { class: 'note' },
           'Same stack as the Image, PCB and Schematic analyzers: your own key first — browser straight to Google, so the photo touches no server of ours — then your proxy, then the shared service. If a model is retired or rate limited, the next one down is tried automatically.'),
+        el('div', { class: 'note warn', style: { marginTop: '8px' } },
+          'Google\'s free tier does not include the image models — a free key answers every age transform with a quota error, however new it is. This backend needs a key from a project with billing enabled. Workers AI above is the free one.'),
         el('div', { style: { height: '10px' } }),
         row('API key', key),
         keyNote,
         row('Model', model),
         el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', margin: '6px 0' } }, test, testNote),
-        el('div', { style: { height: '4px' } }),
+        el('div', { class: 'hint' }, 'A key is free from aistudio.google.com/apikey, but only a billed project can generate images.')
+      );
+
+      // Which Worker the two hosted backends talk to. Shared by both, so it
+      // sits outside either.
+      const service = el('div', {},
+        el('div', { style: { height: '10px' } }),
         row('Shared service', shared,
           el('span', { class: 'hint' },
             sharedProxyStore.available()
-              ? 'Off means nothing is sent anywhere but Google, with your key.'
+              ? 'The Worker this app ships with. Off means nothing is sent to it at all.'
               : 'No shared service is configured in this build.')),
-        row('Your proxy', proxyUrl),
+        row('Your Worker', proxyUrl),
         row('Passphrase', proxyToken),
         el('div', { class: 'hint' },
-          'A key is free from aistudio.google.com/apikey. The proxy is worker/ in this repo — deploy your own if you would rather the photos went through your Cloudflare account than someone else\'s.')
+          'The Worker is worker/ in this repo — deploy your own if you would rather the photos went through your Cloudflare account than someone else\'s.')
       );
 
       /* ---------------- the two older transports ---------------- */
@@ -521,6 +537,8 @@ export function openAISettings(onSaved = () => {}) {
 
       const sync = () => {
         const p = provider.value;
+        cloudflare.style.display = p === 'cloudflare' ? '' : 'none';
+        service.style.display = p === 'cloudflare' || p === 'gemini' ? '' : 'none';
         gemini.style.display = p === 'gemini' ? '' : 'none';
         custom.style.display = p === 'custom' ? '' : 'none';
         replicate.style.display = p === 'replicate' ? '' : 'none';
@@ -534,7 +552,7 @@ export function openAISettings(onSaved = () => {}) {
         el('div', { style: { height: '12px' } }),
         row('Provider', provider),
         el('div', { style: { height: '6px' } }),
-        gemini, custom, replicate, off, quota
+        cloudflare, gemini, service, custom, replicate, off, quota
       );
       sync();
 

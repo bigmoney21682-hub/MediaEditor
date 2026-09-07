@@ -27,6 +27,12 @@ DAILY_CAP = "15"
 # reads is always RATE_LIMIT. Each app counts separately, so a viewer gets a
 # full allowance here rather than one pooled across all four.
 #   npx wrangler kv namespace create RATE_LIMIT
+# Cloudflare's own image model, used by /edit. This binding authenticates as
+# the account, so the keyless route needs no secret at all — the free
+# allowance is 10,000 neurons a day, about eighty edits.
+[ai]
+binding = "AI"
+
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "dd73f0d4d9014b5bb304b3dff3053430"

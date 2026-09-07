@@ -15,14 +15,12 @@
  */
 
 import { makeCanvas, copyCanvas, clamp, fitScale } from '../util.js';
-import { editImage } from '../ai/gemini.js';
 import { apiKeyStore, modelStore } from '../ai/proxy.js';
-import { buildAgePrompt } from '../ai/prompt.js';
+import { buildAgePrompt, buildShortAgePrompt } from '../ai/prompt.js';
 
-/** Longest edge sent to the model. The image models render around 1024px, so
- *  sending much more is upload time bought for detail that comes back lost. */
-const SEND_MAX_FACE = 1024;
-const SEND_MAX_PHOTO = 1280;
+/** How much bigger the whole-photo send may be than a face crop. Each provider
+ *  names its own base size — see the descriptors in ai/. */
+const PHOTO_SCALE = 1.25;
 
 /**
  * How far past the detector's box to crop.
@@ -40,18 +38,86 @@ const FEATHER = 0.12;
 
 const b64 = (dataUrl) => dataUrl.slice(dataUrl.indexOf(',') + 1);
 
-/** Crop rect for one face, in source pixels, clamped to the image. */
+/**
+ * The mask an inpainting model paints inside: white where it may work, black
+ * where the original must survive untouched.
+ *
+ * Drawn as a soft-edged ellipse rather than the whole crop, because the crop
+ * is padded out to include hair and neck and those edges are where the result
+ * has to meet the original photograph. The blur is what stops that meeting
+ * being a visible seam — the model itself feathers nothing.
+ */
+function faceMask(w, h) {
+  const m = makeCanvas(w, h);
+  const c = m.getContext('2d');
+  c.fillStyle = '#000';
+  c.fillRect(0, 0, w, h);
+
+  const blur = Math.round(Math.min(w, h) * 0.06);
+  if (typeof c.filter === 'string') c.filter = `blur(${blur}px)`;
+  c.fillStyle = '#fff';
+  c.beginPath();
+  c.ellipse(w / 2, h * 0.48, w * 0.40, h * 0.44, 0, 0, Math.PI * 2);
+  c.fill();
+  c.filter = 'none';
+  return m;
+}
+
+/** Everything may change. Used only for whole-photo sends, where there is no
+ *  region to protect and the point is a new rendering of the frame. */
+function fullMask(w, h) {
+  const m = makeCanvas(w, h);
+  const c = m.getContext('2d');
+  c.fillStyle = '#fff';
+  c.fillRect(0, 0, w, h);
+  return m;
+}
+
+/**
+ * How far the model may travel from the original, from the years asked for.
+ *
+ * Below about 0.4 an inpainting model returns the face it was given; above
+ * about 0.8 the mask stops mattering, because what it paints inside is a new
+ * person rather than an older one. The whole usable range is in between.
+ */
+const modelStrengthFor = (years) => clamp(0.42 + (years / 40) * 0.33, 0.42, 0.78);
+
+/**
+ * Crop rect for one face, in source pixels, clamped to the image.
+ *
+ * Squared off afterwards, because the models do not promise to return the
+ * aspect ratio they were given — FLUX hands back a square whatever goes in.
+ * Scaling a square answer into an oblong hole stretches the face, and a
+ * stretched face is worse than no transform at all. A square crop makes the
+ * question moot.
+ */
 function cropRect(box, w, h) {
   const x0 = clamp(box.x - box.w * PAD.side, 0, w);
   const y0 = clamp(box.y - box.h * PAD.top, 0, h);
   const x1 = clamp(box.x + box.w * (1 + PAD.side), 0, w);
   const y1 = clamp(box.y + box.h * (1 + PAD.bottom), 0, h);
-  return {
+
+  let rect = {
     x: Math.round(x0),
     y: Math.round(y0),
     w: Math.max(16, Math.round(x1 - x0)),
     h: Math.max(16, Math.round(y1 - y0))
   };
+
+  // Grow the short side around the centre, then slide back inside the image.
+  // A photo narrower than the square it wants keeps its oblong crop — better a
+  // little distortion than a crop that misses half the face.
+  const side = Math.min(Math.max(rect.w, rect.h), w, h);
+  const cx = rect.x + rect.w / 2;
+  const cy = rect.y + rect.h / 2;
+  rect = {
+    x: Math.round(clamp(cx - side / 2, 0, w - side)),
+    y: Math.round(clamp(cy - side / 2, 0, h - side)),
+    w: Math.round(side),
+    h: Math.round(side)
+  };
+
+  return rect;
 }
 
 /** A canvas holding `rect` of `src`, scaled to fit `max`. */
@@ -124,10 +190,15 @@ function decode(dataUrl) {
  * @param {object} opts
  * @param {{box:{x,y,w,h}}[]} opts.faces faces in *source pixels*
  * @param {'face'|'photo'} opts.scope
+ * @param {(input:object, opts:object) => Promise<string>} editImage
+ *        the provider's edit call, injected by remote.js so this module does
+ *        not have to know which service is configured — and so remote.js can
+ *        import it without a cycle.
  * @returns {Promise<HTMLCanvasElement>} a canvas the size of `source`
  */
-export async function aiAgeTransform(source, opts) {
+export async function aiAgeTransform(source, opts, provider) {
   const { faces = [], scope = 'face', strength = 1, signal, onStatus = () => {} } = opts;
+  const editImage = provider.edit;
   const shared = {
     apiKey: apiKeyStore.get(),
     model: modelStore.get(),
@@ -137,16 +208,34 @@ export async function aiAgeTransform(source, opts) {
   // Above 1 the on-device engine exaggerates its warp; a generated face has no
   // such dial, so strength becomes how much of it is mixed over the original.
   const alpha = clamp(strength, 0, 1);
-  const prompt = (scope) => buildAgePrompt({ ...opts, scope });
+  const modelStrength = modelStrengthFor(opts.years ?? 10);
+
+  /** One provider takes prose and re-synthesises; the other takes a CLIP-length
+   *  description and a mask. Both are built, and each takes what it reads. */
+  const mime = provider.sendMime ?? 'image/png';
+  const encode = (c) => b64(mime === 'image/jpeg' ? c.toDataURL('image/jpeg', 0.94) : c.toDataURL('image/png'));
+
+  const request = (canvas, scope, maskCanvas) => ({
+    imageBase64: encode(canvas),
+    mimeType: mime,
+    prompt: buildAgePrompt({ ...opts, scope }),
+    shortPrompt: buildShortAgePrompt(opts),
+    // Always PNG: a JPEG mask arrives with soft grey edges where it had hard
+    // black-and-white ones, which is the one place lossy compression changes
+    // the meaning of the data rather than its quality.
+    maskBase64: maskCanvas ? b64(maskCanvas.toDataURL('image/png')) : undefined,
+    modelStrength
+  });
 
   if (scope === 'photo' || !faces.length) {
-    const k = fitScale(source.width, source.height, SEND_MAX_PHOTO, SEND_MAX_PHOTO, 1);
+    const max = Math.round(provider.sendMax * PHOTO_SCALE);
+    const k = fitScale(source.width, source.height, max, max, 1);
     const send = makeCanvas(source.width * k, source.height * k);
     send.getContext('2d').drawImage(source, 0, 0, send.width, send.height);
 
     onStatus('Sending the photo…');
     const url = await editImage(
-      { imageBase64: b64(send.toDataURL('image/jpeg', 0.92)), mimeType: 'image/jpeg', prompt: prompt('photo') },
+      request(send, 'photo', provider.needsMask ? fullMask(send.width, send.height) : null),
       shared
     );
     const img = await decode(url);
@@ -166,11 +255,11 @@ export async function aiAgeTransform(source, opts) {
   for (const [i, face] of faces.entries()) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     const rect = cropRect(face.box, source.width, source.height);
-    const send = cutout(source, rect, SEND_MAX_FACE);
+    const send = cutout(source, rect, provider.sendMax);
 
     onStatus(faces.length > 1 ? `Face ${i + 1} of ${faces.length} — sending…` : 'Sending the face…');
     const url = await editImage(
-      { imageBase64: b64(send.toDataURL('image/jpeg', 0.94)), mimeType: 'image/jpeg', prompt: prompt('face') },
+      request(send, 'face', provider.needsMask ? faceMask(send.width, send.height) : null),
       { ...shared, onStatus: (s) => onStatus(faces.length > 1 ? `Face ${i + 1} of ${faces.length} — ${s}` : s) }
     );
     compositeFeathered(out, await decode(url), rect, alpha);

@@ -66,8 +66,16 @@ export function buildAgePrompt({ years, direction, geometry = true, skinTexture 
     'the camera characteristics — focus, grain, depth of field and overall photographic quality'
   ];
 
+  // The opening sentence earns its place. Editing models drift — a prompt that
+  // leads with the change produces a new photograph of a similar person, with
+  // a different expression and different clothes, while one that leads with
+  // what must not move holds the frame far more often. Measured side by side
+  // on the same input, this ordering was the difference between a portrait
+  // that could be composited back and one that could not.
   return [
-    `Edit this photograph so the ${scope === 'face' ? 'person shown' : 'people shown'} appear approximately ${years} years ${verb}: ${severity(years, direction)}.`,
+    'Keep this photograph exactly as it is: the same person — the same face, the same sex, the same ethnicity, the same hairstyle, the same distinguishing features — and the same crop and framing, head angle and pose, expression, clothing, background and lighting.',
+    '',
+    `Change one thing only — the apparent age of the ${scope === 'face' ? 'person shown' : 'people shown'}, by approximately ${years} years ${verb}: ${severity(years, direction)}.`,
     '',
     'Change only what ageing changes:',
     ...changes.map((c) => `- ${c}`),
@@ -79,3 +87,35 @@ export function buildAgePrompt({ years, direction, geometry = true, skinTexture 
     'It must read as an ordinary photograph of that person at a different age — photorealistic, not stylised, not illustrated, not retouched into a different face.'
   ].join('\n');
 }
+
+/**
+ * The same request, compressed for a CLIP-conditioned model.
+ *
+ * Stable Diffusion reads roughly 77 tokens and then stops, so the careful
+ * instruction list above reaches it as its first two lines and nothing else —
+ * which is exactly the half that says "keep everything the same" and none of
+ * the half that says what to change. Inpainting also makes most of that list
+ * redundant: the mask already holds the pose, the framing and the background,
+ * because those pixels are never touched.
+ *
+ * So this is a description of the wanted result rather than a set of
+ * instructions, which is the register these models were trained on.
+ */
+export function buildShortAgePrompt({ years, direction, skinTexture = true, hair = true }) {
+  const older = direction !== 'younger';
+  const bits = [`portrait photograph of the same person, ${years} years ${older ? 'older' : 'younger'}`];
+
+  if (skinTexture)
+    bits.push(older ? 'aged wrinkled skin, deep creases, age spots' : 'smooth youthful skin, no wrinkles');
+  if (hair) bits.push(older ? 'grey thinning hair' : 'full natural-coloured hair');
+  if (older && years > 20) bits.push('sagging jawline, hollow cheeks');
+
+  bits.push('same face, same pose, same expression, photorealistic, sharp focus');
+  return bits.join(', ');
+}
+
+/** What Stable Diffusion must not draw. Cheap insurance against the two things
+ *  it does unprompted to a face: smoothing it into a portrait painting, and
+ *  turning a mild age change into a caricature. */
+export const AGE_NEGATIVE_PROMPT =
+  'cartoon, illustration, painting, 3d render, distorted face, extra faces, blurry, low quality, different person';

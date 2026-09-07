@@ -22,6 +22,62 @@
  * below and set them before you publish the URL.
  */
 
+/**
+ * Cloudflare's own image model, which is the reason this Worker can serve an
+ * age transform to someone with no API key whatsoever.
+ *
+ * The AI binding authenticates as the account rather than a key, so there is
+ * nothing to pool, rotate or leak here — the key-pool machinery below exists
+ * only for the Google route.
+ *
+ * It is the *inpainting* model rather than FLUX, and that choice was made the
+ * hard way. Cloudflare lists FLUX.2 [klein] as "unifying generation and
+ * editing", it accepts an image in its multipart body without complaint, and
+ * the pictures it returns are far better looking than these. It also ignores
+ * the image completely: asked to add a green dot to a photograph of a face, it
+ * returned a green dot on a wall it had invented. Every "edit" it produced was
+ * text-to-image, and looked convincing only because the prompt described the
+ * input in words. Cloudflare's own catalogue calls its task Text-to-Image, and
+ * that is the truth of it.
+ *
+ * Stable Diffusion inpainting is the model that actually reads the pixels: it
+ * takes the image and a mask of what may change, and leaves everything outside
+ * the mask alone. It is 512px and softer than a modern model, which is the
+ * price of the only free image editing on offer.
+ */
+const IMAGE_MODEL = '@cf/runwayml/stable-diffusion-v1-5-inpainting'
+
+/**
+ * `strength` is how far from the original the result may travel: too low and
+ * nothing ages, too high and the mask stops mattering because a new face is
+ * drawn inside it. The app maps its years slider onto this.
+ *
+ * num_steps is capped at 20 by the model, and 20 is what a face needs.
+ */
+async function runImageEdit(env, { prompt, image_b64, mask_b64, strength = 0.6 }) {
+  const bytes = (b64) => [...Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))]
+
+  const out = await env.AI.run(IMAGE_MODEL, {
+    prompt,
+    image: bytes(image_b64),
+    // The schema calls it `mask`; the model's own error message calls it
+    // `mask_image`. Sending both is a byte of duplication against a rename.
+    mask: bytes(mask_b64),
+    mask_image: bytes(mask_b64),
+    strength: Math.min(0.95, Math.max(0.05, Number(strength) || 0.6)),
+    num_steps: 20,
+  })
+
+  if (out?.image) return out.image
+  if (out instanceof ReadableStream) {
+    const buf = new Uint8Array(await new Response(out).arrayBuffer())
+    let s = ''
+    for (let i = 0; i < buf.length; i += 8192) s += String.fromCharCode(...buf.subarray(i, i + 8192))
+    return btoa(s)
+  }
+  throw new Error('The image model returned no image.')
+}
+
 /** ISO date in UTC. The quota day boundary, and the KV key's namespace. */
 const today = () => new Date().toISOString().slice(0, 10)
 
@@ -173,7 +229,14 @@ const quotaSlot = (request) => `rl:${today()}:${request.headers.get('CF-Connecti
 async function readQuota(request, env) {
   if (!env.RATE_LIMIT) return { enabled: false }
   const limit = Number(env.DAILY_CAP ?? DEFAULT_DAILY_CAP)
-  const used = Number((await env.RATE_LIMIT.get(quotaSlot(request))) ?? 0)
+  let used = 0
+  try {
+    used = Number((await env.RATE_LIMIT.get(quotaSlot(request))) ?? 0)
+  } catch {
+    // Same reasoning as spendQuota: an unreadable counter is not a reason to
+    // refuse anyone.
+    return { enabled: false }
+  }
   return {
     enabled: true,
     limit,
@@ -197,11 +260,22 @@ async function spendQuota(request, env) {
   if (!before.enabled) return { ...before, allowed: true }
   if (before.remaining <= 0) return { ...before, allowed: false }
 
-  // expirationTtl rather than a cleanup pass: the counter should evaporate on
-  // its own a day after the last request that touched it.
-  await env.RATE_LIMIT.put(quotaSlot(request), String(before.used + 1), {
-    expirationTtl: 60 * 60 * 26,
-  })
+  try {
+    // expirationTtl rather than a cleanup pass: the counter should evaporate
+    // on its own a day after the last request that touched it.
+    await env.RATE_LIMIT.put(quotaSlot(request), String(before.used + 1), {
+      expirationTtl: 60 * 60 * 26,
+    })
+  } catch {
+    // The counter is bookkeeping; the service is the point. KV's free plan
+    // allows a thousand writes a day across the account, and when that runs
+    // out — or the namespace has a bad minute — an unhandled throw here turns
+    // every request into a 1101 with an empty body, which is a far worse
+    // outcome than a cap that stops counting for a while. So: serve the
+    // request, and stop claiming a cap we can no longer keep.
+    return { ...before, enabled: false, allowed: true }
+  }
+
   return { ...before, used: before.used + 1, remaining: before.remaining - 1, allowed: true }
 }
 
@@ -302,6 +376,54 @@ export default {
     // The allowance, readable without spending any of it. The app calls this
     // on load so the homescreen can show what is left before anyone uploads
     // anything — polling the real endpoints for that would be self-defeating.
+    // The keyless route. Everything above this line is about Google keys;
+    // this one runs on the account's own Workers AI allowance, which is why it
+    // is the app's default and the only one that works out of the box.
+    if (url.pathname === '/edit' && request.method === 'POST') {
+      if (!env.AI)
+        return fail(500, 'This proxy has no Workers AI binding. Add [ai] to wrangler.toml.', request, env)
+
+      const body = await request.arrayBuffer()
+      if (body.byteLength > MAX_BODY_BYTES)
+        return fail(413, 'That photo is too large for the shared service.', request, env)
+
+      const quota = await spendQuota(request, env)
+      if (!quota.allowed)
+        return fail(
+          429,
+          'The shared service has hit its daily limit for your address. Try again ' +
+            'tomorrow, or use the on-device engine, which has no limit at all.',
+          request,
+          env,
+          quotaHeaders(quota),
+        )
+
+      let input
+      try {
+        input = JSON.parse(new TextDecoder().decode(body))
+      } catch {
+        return fail(400, 'That request body is not JSON.', request, env, quotaHeaders(quota))
+      }
+      if (!input?.prompt || !input?.image_b64 || !input?.mask_b64)
+        return fail(400, 'Send { prompt, image_b64, mask_b64 }.', request, env, quotaHeaders(quota))
+
+      try {
+        const image = await runImageEdit(env, input)
+        return new Response(JSON.stringify({ image }), {
+          headers: {
+            'Content-Type': 'application/json',
+            'Cache-Control': 'no-store',
+            ...corsHeaders(request, env),
+            ...quotaHeaders(quota),
+          },
+        })
+      } catch (e) {
+        // Surfaced verbatim: the model's own refusals ("prompt was flagged",
+        // "input image too large") say more than anything worth substituting.
+        return fail(502, String(e?.message ?? e).slice(0, 400), request, env, quotaHeaders(quota))
+      }
+    }
+
     if (url.pathname === '/quota')
       return new Response(JSON.stringify(await readQuota(request, env)), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...cors },
