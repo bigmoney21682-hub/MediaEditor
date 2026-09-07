@@ -95,8 +95,25 @@ function friendlyError(status, body, model = DEFAULT_MODEL) {
   if (status === 403) return `Access denied.${suffix}`;
   if (status === 413)
     return 'The photo is too large for the API. Age one face at a time rather than the whole photo, or scale the image down first.' + suffix;
-  if (status === 429)
-    return 'Rate limited — image generation has a tight free-tier cap. Wait a moment and try again.' + suffix;
+  if (status === 429) {
+    // Two very different things arrive as 429, and telling someone to "wait a
+    // moment" when it is the second one wastes their afternoon.
+    //
+    // A free-tier key is not rate limited on the image models — it has no
+    // image quota at all. Google reports this as a QuotaFailure naming
+    // GenerateRequestsPerDayPerProjectPerModel-FreeTier, and it is not a
+    // condition that clears overnight: verified against three separate keys
+    // on three image models, while the same keys list models and run text
+    // requests perfectly well.
+    if (/FreeTier|free_tier/.test(body))
+      return (
+        'This key is on the free tier, which does not include image generation — ' +
+        'only the text models. Nothing here will make it work: the project behind ' +
+        'the key needs billing enabled, or you can stay on the on-device engine, ' +
+        'which has no quota and no upload.' + suffix
+      );
+    return 'Rate limited — the per-minute cap. Wait a moment and try again.' + suffix;
+  }
   if (status === 404)
     return `Model "${model}" is not available to your key. Open AI settings, press Test, and pick from the list.${suffix}`;
   if (status >= 500) return 'Google returned a server error. Usually transient — try again.' + suffix;

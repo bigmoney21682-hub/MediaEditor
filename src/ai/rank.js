@@ -29,6 +29,12 @@ export function scoreModel(id) {
   // returns the same photo changed, which is exactly an age transform.
   if (s.includes('flash')) score += 30;
 
+  // Pro image models render better and cost more. Second tier deliberately,
+  // rather than by accident of scoring nothing at all — a handful of them are
+  // in the listing now (gemini-3-pro-image and its preview), and when flash is
+  // out of quota they are the next thing worth asking.
+  else if (s.includes('pro')) score += 20;
+
   // Stable over preview, but only just — for a while the preview alias was the
   // only image model in the list, and ranking it below nothing is no help.
   if (/preview|exp/.test(s)) score -= 6;
