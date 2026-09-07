@@ -1,9 +1,12 @@
 import { doc, pushHistory, addLayer, makeImageLayer, emit } from '../state.js';
 import { renderDoc, requestRender } from '../render.js';
-import { makeCanvas, clamp, toast, loadImage, canvasFromImage, fitScale } from '../util.js';
+import { makeCanvas, toast, fitScale } from '../util.js';
 import { detectFaces } from '../face/landmarks.js';
-import { ageTransform, amountForYears } from '../face/age.js';
-import { getConfig, setConfig, isConfigured, remoteAge } from '../face/remote.js';
+import { ageTransform } from '../face/age.js';
+import { getConfig, setConfig, isConfigured, consent, describeBackend, runAI } from '../face/remote.js';
+import { apiKeyStore, modelStore, proxyStore, sharedProxyStore, quotaStore, usingProxy } from '../ai/proxy.js';
+import { diagnoseKey, sanitizeKey } from '../ai/apikey.js';
+import { listGeminiModels, DEFAULT_MODEL } from '../ai/gemini.js';
 import { openModal, el, row, slider, segmented, field } from './modal.js';
 
 const DETECT_MAX = 1024;      // landmark detection resolution
@@ -33,7 +36,12 @@ export function openAgeDialog() {
   const opts = {
     direction: 'older', years: 10, strength: 1,
     geometry: true, skinTexture: true, hair: true,
-    backend: isConfigured() ? 'ai' : 'local'
+    // The AI engine is never the default, however well configured it is: it
+    // uploads a photograph of someone's face, and that is a choice to make on
+    // purpose rather than to discover afterwards.
+    backend: 'local',
+    // Which pixels the model is allowed to touch. See face/aiage.js.
+    scope: 'face'
   };
   let faces = null;        // normalised
   let manualBox = null;    // normalised, user-drawn fallback
@@ -107,31 +115,70 @@ export function openAgeDialog() {
 
       /* ---- engine ---- */
       const engineWrap = el('div');
+      const hint = (text) => el('div', { class: 'hint', style: { marginTop: '6px' } }, text);
+
+      /** The shared service's daily allowance, when one is in the path. */
+      const quotaLine = () => {
+        const q = quotaStore.get();
+        if (!q?.enabled) return null;
+        return hint(`Shared service: ${q.remaining} of ${q.limit} renders left today for this address.`);
+      };
+
       const renderEngine = () => {
-        engineWrap.replaceChildren(
-          field('Engine',
-            segmented(
-              [['local', 'On-device'], ['ai', isConfigured() ? 'AI model' : 'AI (setup)']],
-              opts.backend,
-              (v) => {
-                if (v === 'ai' && !isConfigured()) { openAISettings(renderEngine); opts.backend = 'local'; renderEngine(); return; }
-                opts.backend = v;
-                schedule();
-              }
-            ),
-            el('div', { class: 'hint', style: { marginTop: '6px' } },
-              opts.backend === 'ai'
-                ? 'Sends the photo to the endpoint you configured. Preview is on-device; the AI runs on Apply.'
-                : 'Runs entirely in this browser. A physical simulation of ageing, not a prediction of a specific face.'),
-            el('button', {
-              class: 'btn tiny', style: { marginTop: '6px' },
-              onclick: () => openAISettings(renderEngine)
-            }, isConfigured() ? 'AI settings…' : 'Set up AI backend…')
+        const ai = opts.backend === 'ai';
+        const nodes = [
+          segmented(
+            [['local', 'On-device'], ['ai', isConfigured() ? 'AI model' : 'AI (setup)']],
+            opts.backend,
+            (v) => {
+              if (v === 'ai' && !isConfigured()) { openAISettings(renderEngine); opts.backend = 'local'; renderEngine(); return; }
+              opts.backend = v;
+              renderEngine();
+              schedule();
+            }
           )
-        );
+        ];
+
+        if (ai && !consent.get()) {
+          // Asked once, before the first upload, and remembered afterwards.
+          const allow = el('button', { class: 'btn tiny', style: { marginTop: '6px' } }, 'I understand — allow uploads');
+          allow.addEventListener('click', () => { consent.set(true); renderEngine(); });
+          nodes.push(
+            el('div', { class: 'note warn', style: { marginTop: '6px' } },
+              `This sends the photo to ${describeBackend()}. It is a photograph of someone's face leaving your machine, which is worth deciding on purpose.`),
+            allow
+          );
+        } else if (ai) {
+          nodes.push(
+            field('Model sees', segmented(
+              [['face', 'Face region'], ['photo', 'Whole photo']],
+              opts.scope,
+              (v) => { opts.scope = v; renderEngine(); }
+            )),
+            hint(opts.scope === 'face'
+              ? 'Sends a padded crop around each detected face and blends the result back through a soft mask — everything outside it stays your original pixels.'
+              : 'Sends the whole photo. The model redraws every pixel, background and grain included.'),
+            hint(`Runs against ${describeBackend()} when you press Apply. The preview beside it stays on-device.`),
+            quotaLine()
+          );
+        } else {
+          nodes.push(hint('Runs entirely in this browser. A physical simulation of ageing, not a prediction of a specific face.'));
+        }
+
+        nodes.push(el('button', {
+          class: 'btn tiny', style: { marginTop: '6px' },
+          onclick: () => openAISettings(renderEngine)
+        }, isConfigured() ? 'AI settings…' : 'Set up AI backend…'));
+
+        engineWrap.replaceChildren(field('Engine', ...nodes.filter(Boolean)));
       };
       renderEngine();
       right.append(engineWrap);
+
+      // Knowing the allowance before a render is started beats discovering it
+      // when one is refused. One cheap request, and only when a proxy is in
+      // the path at all.
+      if (usingProxy()) quotaStore.refresh().then(() => renderEngine());
 
       content.append(status, pair, controls);
 
@@ -240,21 +287,36 @@ export function openAgeDialog() {
 
       content._apply = async (setBusy) => {
         const list = activeFaces();
-        if (!list.length) { toast('Mark a face first — drag a box on the Original.', 'err'); return false; }
+        // Whole-photo AI mode is the one path that needs no face box: the model
+        // is being handed the picture, not a region of it. Everything else
+        // works from a region and has nothing to do without one.
+        const needsFace = !(opts.backend === 'ai' && opts.scope === 'photo');
+        if (!list.length && needsFace) {
+          toast('Mark a face first — drag a box on the Original, or send the whole photo.', 'err');
+          return false;
+        }
 
         if (opts.backend === 'ai') {
-          setBusy('Sending to your AI backend…');
+          // Set before the first await so the footer can turn Cancel into Stop
+          // the moment the request is actually in flight.
+          const ctrl = new AbortController();
+          content._abort = () => ctrl.abort();
+          setBusy('Preparing the photo…');
           try {
-            const url = await remoteAge(source.toDataURL('image/jpeg', 0.94), {
-              years: opts.years, direction: opts.direction,
+            const out = await runAI(source, {
+              ...opts,
+              faces: project(list, source.width, source.height),
+              signal: ctrl.signal,
               onStatus: (s) => setBusy(s)
             });
-            const img = await loadImage(url);
-            addResult(canvasFromImage(img), opts);
+            addResult(out, opts);
             return true;
           } catch (e) {
-            toast('AI backend failed: ' + e.message, 'err');
+            if (e?.name === 'AbortError') toast('Stopped.');
+            else toast('AI backend failed: ' + e.message, 'err');
             return false;
+          } finally {
+            content._abort = null;
           }
         }
 
@@ -270,18 +332,38 @@ export function openAgeDialog() {
       const busy = el('span', { class: 'busy', style: { marginRight: 'auto', display: 'none' } });
       const cancel = el('button', { class: 'btn' }, 'Cancel');
       const apply = el('button', { class: 'btn primary' }, 'Apply as new layer');
-      cancel.addEventListener('click', () => close());
+      const contentOf = () => f.parentElement.querySelector('.content');
+
+      // A generative render takes tens of seconds, which is far too long to be
+      // trapped in — so while one is in flight Cancel becomes Stop and aborts
+      // it. The on-device render has nothing to abort, so it stays disabled
+      // for the moment it takes.
+      cancel.addEventListener('click', () => {
+        const abort = contentOf()._abort;
+        if (abort) abort();
+        else close();
+      });
+
       apply.addEventListener('click', async () => {
-        const content = f.parentElement.querySelector('.content');
-        apply.disabled = cancel.disabled = true;
+        const content = contentOf();
+        apply.disabled = true;
         const setBusy = (msg) => {
           busy.style.display = 'flex';
           busy.replaceChildren(el('span', { class: 'spin' }), msg);
         };
         setBusy('Working…');
-        const ok = await content._apply(setBusy);
+
+        const running = content._apply(setBusy);
+        cancel.disabled = !content._abort;
+        cancel.textContent = content._abort ? 'Stop' : 'Cancel';
+
+        const ok = await running;
         if (ok) close();
-        else { apply.disabled = cancel.disabled = false; busy.style.display = 'none'; }
+        else {
+          apply.disabled = cancel.disabled = false;
+          cancel.textContent = 'Cancel';
+          busy.style.display = 'none';
+        }
       });
       f.append(busy, cancel, apply);
     }
@@ -302,56 +384,175 @@ function addResult(canvas, opts) {
 
 /* ------------------------------------------------------------ AI settings */
 
+/** Models worth offering before a key has been tested. The list from Test is
+ *  always better, because it comes from the key itself. */
+const KNOWN_IMAGE_MODELS = [DEFAULT_MODEL, 'gemini-2.5-flash-image-preview', 'gemini-2.0-flash-preview-image-generation'];
+
 export function openAISettings(onSaved = () => {}) {
   const cfg = getConfig();
+
   openModal({
     title: 'AI backend',
     build(content) {
       const provider = el('select', {});
-      for (const [v, label] of [['none', 'Off — on-device only'], ['custom', 'Custom endpoint'], ['replicate', 'Replicate']]) {
+      for (const [v, label] of [
+        ['gemini', 'Google Gemini — shared with the analyzer apps'],
+        ['custom', 'Custom endpoint'],
+        ['replicate', 'Replicate'],
+        ['none', 'Off — on-device only']
+      ]) {
         const o = el('option', { value: v }, label);
         if (cfg.provider === v) o.selected = true;
         provider.appendChild(o);
       }
-      const endpoint = el('input', { type: 'text', value: cfg.endpoint, placeholder: 'https://your-worker.example.com/age' });
-      const token = el('input', { type: 'password', value: cfg.token, placeholder: 'API key' });
-      const model = el('input', { type: 'text', value: cfg.model, placeholder: 'model version hash' });
-      const proxy = el('input', { type: 'text', value: cfg.proxy, placeholder: 'https://your-proxy.example.com (optional)' });
 
-      const rEndpoint = row('Endpoint', endpoint);
-      const rToken = row('API key', token);
-      const rModel = row('Model', model);
-      const rProxy = row('Proxy', proxy);
+      /* ---------------- Gemini: key, model, proxy ---------------- */
+
+      const shared = el('input', { type: 'checkbox' });
+      shared.checked = sharedProxyStore.get();
+      shared.disabled = !sharedProxyStore.available();
+
+      const proxyUrl = el('input', { type: 'text', value: proxyStore.get().url, placeholder: 'https://your-worker.workers.dev' });
+      const proxyToken = el('input', { type: 'password', value: proxyStore.get().token, placeholder: 'passphrase, if the worker sets one' });
+
+      const key = el('input', { type: 'password', value: apiKeyStore.get(), placeholder: 'AIza… or AQ.…' });
+      const keyNote = el('div', { class: 'hint' });
+      const model = el('select', {});
+      const testNote = el('div', { class: 'hint' });
+      const test = el('button', { class: 'btn tiny' }, 'Test key & list models');
+
+      const setModels = (ids) => {
+        const chosen = modelStore.get();
+        const all = [...new Set([...ids, ...(chosen ? [chosen] : [])])];
+        model.replaceChildren(
+          el('option', { value: '' }, `Automatic — best available (${DEFAULT_MODEL} first)`),
+          ...all.map((id) => {
+            const o = el('option', { value: id }, id);
+            if (id === chosen) o.selected = true;
+            return o;
+          })
+        );
+      };
+      setModels(KNOWN_IMAGE_MODELS);
+
+      const showDiagnosis = () => {
+        const d = diagnoseKey(key.value);
+        keyNote.textContent = d ? d.message : 'Optional. Without one, requests go through the proxy below.';
+        keyNote.style.color = d?.level === 'error' ? 'var(--danger)' : d?.level === 'warn' ? 'var(--gold)' : '';
+      };
+      key.addEventListener('input', showDiagnosis);
+      showDiagnosis();
+
+      test.addEventListener('click', async () => {
+        test.disabled = true;
+        testNote.textContent = 'Asking Google what this key can reach…';
+        try {
+          // Saved first: a test that used a key the app is not going to keep
+          // would answer a question nobody asked.
+          apiKeyStore.set(key.value);
+          proxyStore.set({ url: proxyUrl.value, token: proxyToken.value });
+          sharedProxyStore.set(shared.checked);
+
+          const { all, image } = await listGeminiModels(sanitizeKey(key.value));
+          setModels(image);
+          testNote.textContent = image.length
+            ? `Works. ${all.length} models reachable, ${image.length} of them can generate images.`
+            : `Works, but none of the ${all.length} models reachable this way can generate an image — only the on-device engine will run.`;
+          testNote.style.color = image.length ? 'var(--ok)' : 'var(--gold)';
+        } catch (e) {
+          testNote.textContent = e.message;
+          testNote.style.color = 'var(--danger)';
+        } finally {
+          test.disabled = false;
+        }
+      });
+
+      const gemini = el('div', {},
+        el('div', { class: 'note' },
+          'Same stack as the Image, PCB and Schematic analyzers: your own key first — browser straight to Google, so the photo touches no server of ours — then your proxy, then the shared service. If a model is retired or rate limited, the next one down is tried automatically.'),
+        el('div', { style: { height: '10px' } }),
+        row('API key', key),
+        keyNote,
+        row('Model', model),
+        el('div', { style: { display: 'flex', gap: '8px', alignItems: 'center', margin: '6px 0' } }, test, testNote),
+        el('div', { style: { height: '4px' } }),
+        row('Shared service', shared,
+          el('span', { class: 'hint' },
+            sharedProxyStore.available()
+              ? 'Off means nothing is sent anywhere but Google, with your key.'
+              : 'No shared service is configured in this build.')),
+        row('Your proxy', proxyUrl),
+        row('Passphrase', proxyToken),
+        el('div', { class: 'hint' },
+          'A key is free from aistudio.google.com/apikey. The proxy is worker/ in this repo — deploy your own if you would rather the photos went through your Cloudflare account than someone else\'s.')
+      );
+
+      /* ---------------- the two older transports ---------------- */
+
+      const endpoint = el('input', { type: 'text', value: cfg.endpoint, placeholder: 'https://your-worker.example.com/age' });
+      const custom = el('div', {},
+        row('Endpoint', endpoint),
+        el('div', { class: 'hint' },
+          'POST {image, years, direction} → {image}. Browsers block cross-origin calls without CORS headers, so this has to be an endpoint of yours; see the README.')
+      );
+
+      const repToken = el('input', { type: 'password', value: cfg.token, placeholder: 'r8_…' });
+      const repModel = el('input', { type: 'text', value: cfg.model, placeholder: 'model version hash' });
+      const repProxy = el('input', { type: 'text', value: cfg.proxy, placeholder: 'https://your-relay.example.com (optional)' });
+      const replicate = el('div', {},
+        row('API token', repToken),
+        row('Model', repModel),
+        row('Relay', repProxy),
+        el('div', { class: 'hint' },
+          'Replicate sends no CORS headers, so a browser cannot call it directly — point Relay at a small proxy of your own and keep the token on it rather than here.')
+      );
+
+      const off = el('div', { class: 'note' },
+        'Only the on-device engine will run. Nothing is uploaded, and the AI option in the dialog stays greyed out.');
+
+      const quota = el('div', { class: 'hint', style: { marginTop: '10px' } });
+      const showQuota = () => {
+        const q = quotaStore.get();
+        quota.textContent = q?.enabled
+          ? `Shared service allowance: ${q.remaining} of ${q.limit} left today for this address.`
+          : '';
+      };
+      showQuota();
 
       const sync = () => {
         const p = provider.value;
-        rEndpoint.style.display = p === 'custom' ? '' : 'none';
-        rToken.style.display = p === 'none' ? 'none' : '';
-        rModel.style.display = p === 'replicate' ? '' : 'none';
-        rProxy.style.display = p === 'replicate' ? '' : 'none';
+        gemini.style.display = p === 'gemini' ? '' : 'none';
+        custom.style.display = p === 'custom' ? '' : 'none';
+        replicate.style.display = p === 'replicate' ? '' : 'none';
+        off.style.display = p === 'none' ? '' : 'none';
       };
       provider.addEventListener('change', sync);
 
       content.append(
         el('div', { class: 'note' },
-          'The on-device engine simulates ageing and never leaves your machine. A generative model produces photoreal results but uploads the photo to whatever service you point at here. Keys are stored only in this browser.'),
+          'The on-device engine simulates ageing and never leaves your machine. A generative model produces photoreal results but uploads the photo to whichever service you pick here. Keys are stored only in this browser.'),
         el('div', { style: { height: '12px' } }),
         row('Provider', provider),
-        rEndpoint, rToken, rModel, rProxy,
-        el('div', { class: 'hint' },
-          'Custom endpoint contract — POST {image, years, direction} and reply {image}. Browsers block cross-origin calls without CORS headers, so Replicate needs a small proxy of your own; see the README.')
+        el('div', { style: { height: '6px' } }),
+        gemini, custom, replicate, off, quota
       );
       sync();
+
       content._save = () => {
+        apiKeyStore.set(key.value);
+        modelStore.set(model.value);
+        proxyStore.set({ url: proxyUrl.value, token: proxyToken.value });
+        sharedProxyStore.set(shared.checked);
         setConfig({
           provider: provider.value,
           endpoint: endpoint.value.trim(),
-          token: token.value.trim(),
-          model: model.value.trim(),
-          proxy: proxy.value.trim()
+          token: repToken.value.trim(),
+          model: repModel.value.trim(),
+          proxy: repProxy.value.trim()
         });
       };
     },
+
     footer(f, close) {
       const cancel = el('button', { class: 'btn' }, 'Cancel');
       const save = el('button', { class: 'btn primary' }, 'Save');

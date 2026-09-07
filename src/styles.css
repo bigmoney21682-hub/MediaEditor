@@ -138,7 +138,7 @@ h2, h3 { margin: 0; font-weight: 600; }
   width: 34px; height: 26px; padding: 0; border: 1px solid var(--line-2);
   border-radius: 6px; background: none; cursor: pointer;
 }
-.row select, .row input[type=text], .row input[type=number] {
+.row select, .row input[type=text], .row input[type=password], .row input[type=number] {
   flex: 1; min-width: 0; background: var(--bg-3); color: var(--fg);
   border: 1px solid var(--line-2); border-radius: 7px; padding: 5px 7px;
 }

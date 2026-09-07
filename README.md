@@ -59,16 +59,56 @@ excluded so they stay sharp.
 
 It is convincing, and it is a simulation: it will not predict how a *specific* person actually ages.
 
-**AI backend (optional, bring your own key).** For photoreal output, point the app at a generative
-model. Configure it under *Age Transform → AI settings*. Keys are stored only in your browser's
-localStorage, and nothing is sent anywhere until you pick this engine and press Apply.
+**AI model (optional).** For photoreal output the app drives Google's Gemini image models through
+the same stack the Image Analysis, PCB Analyzer and Schematic Analyzer apps use —
+the same credential chain, the same model fallback, the same Cloudflare Worker proxy. Pick it under
+*Age Transform → Engine → AI model*.
 
-If no face is found, drag a box around one on the Original and the skin and colour passes still run
-(face-shape changes need landmarks).
+It is never the default and never runs unattended: the first time you select it the dialog says
+where the photo would go and asks once, deliberately, before anything is uploaded. The preview pane
+always stays on-device; the model is only called when you press Apply, and Cancel becomes Stop while
+it is in flight.
 
-### Wiring up an AI backend
+**Where a request goes**, in order — each step is only reached when the one before it cannot serve:
 
-Pick **Custom endpoint** and implement this contract:
+| Credential | Route | Cost |
+| --- | --- | --- |
+| Your own Google key | browser → Google directly | nothing touches a server of ours |
+| Your proxy | your own deployment of `worker/` | your Cloudflare account |
+| The shared service | the Worker this repo ships | someone else's key pool and daily cap |
+
+Under that sits model fallback: if the chosen image model is retired, invisible to that key, or rate
+limited, the next best one the key can actually reach is tried instead. Six upstream calls is the
+ceiling, so a bad day surfaces as an error rather than half a minute of silent retrying. A key is
+free from [aistudio.google.com/apikey](https://aistudio.google.com/apikey), and adding one both
+overrides the shared pool and extends it — if your key is spent, the chain falls through rather than
+stopping.
+
+**What the model is allowed to touch.** The obvious integration sends the whole photo and puts what
+comes back on a layer, which is wrong for an editor: the model redraws every pixel, so the
+background shifts, the grain changes, and a portrait of two people ages both when you asked about
+one. So *Model sees → Face region* (the default) sends a padded crop around each detected face and
+composites the result back through a feathered mask — everything outside it is still your original
+file. *Whole photo* is there for the times the crop is the wrong unit, like a full-length shot.
+
+The **Strength** slider mixes the returned face over the original, so a result that overshoots is
+dialled back rather than re-rendered.
+
+If no face is found, drag a box around one on the Original. The on-device skin and colour passes
+still run (face-shape changes need landmarks), and the AI engine uses the box as its crop.
+
+### Running the shared proxy yourself
+
+`worker/` is a Cloudflare Worker holding a pool of Google keys server-side, so a plain link works for
+someone who has no key of their own. It is the analyzers' Worker trimmed to one vendor — Groq is a
+fine second opinion on a *description* of an image and no use here, since it has no image-output
+model. Deploy notes, the limits to set before publishing the URL, and what each refusal means are in
+[`worker/README.md`](worker/README.md). Put the URL it prints into `SHARED_PROXY_URL` at the top of
+`src/ai/proxy.js`.
+
+### The other two backends
+
+**Custom endpoint** — implement this contract and point the app at it:
 
 ```
 POST <your endpoint>
@@ -77,35 +117,8 @@ POST <your endpoint>
 200 { "image": "data:image/png;base64,…" }   // or an https URL
 ```
 
-Browsers can only call an endpoint that returns permissive CORS headers, which is why hosted
-inference APIs need a small relay of your own. A Cloudflare Worker is enough:
-
-```js
-export default {
-  async fetch(req, env) {
-    if (req.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
-    const { image, years, direction } = await req.json();
-    const r = await fetch('https://api.replicate.com/v1/predictions', {
-      method: 'POST',
-      headers: { authorization: `Bearer ${env.REPLICATE_TOKEN}`, 'content-type': 'application/json' },
-      body: JSON.stringify({
-        version: env.MODEL_VERSION,
-        input: { image, target_age: String(direction === 'younger' ? 30 - years : 30 + years) }
-      })
-    });
-    return cors(new Response(r.body, { status: r.status, headers: { 'content-type': 'application/json' } }));
-  }
-};
-
-const cors = (r) => {
-  r.headers.set('access-control-allow-origin', '*');
-  r.headers.set('access-control-allow-headers', 'content-type, authorization');
-  return r;
-};
-```
-
-Keep the token on the worker, not in the browser. The **Replicate** provider option talks to
-`api.replicate.com` directly and accepts a `proxy` origin if you would rather relay it verbatim.
+**Replicate** — talks to `api.replicate.com`, which sends no CORS headers, so it needs a relay of
+your own; the *Relay* field takes its origin. Keep the token on the relay rather than in the browser.
 
 ## Exporting
 
@@ -150,14 +163,23 @@ src/
   render.js             compositor, viewport transform, hit testing
   tools.js              pointer gestures: select/transform, paint, shapes, in-place text, crop
   util.js               canvas, file and download helpers
+  ai/                   the analyzer apps' model stack, ported
+    proxy.js            credential chain: your key, your proxy, the shared service
+    gemini.js           image editing through generateContent, with friendly errors
+    fallback.js         model- and credential-level retry
+    rank.js             which of a key's models can actually draw
+    apikey.js           key hygiene and diagnosis
+    prompt.js           the age-transform instruction
   face/
     landmarks.js        MediaPipe wrapper + canonical landmark groups
     delaunay.js         Bowyer–Watson triangulation
     warp.js             piecewise-affine mesh warp, hulls, feathered outlines
     age.js              the age pipeline: geometry, creases, texture, colour, hair
-    remote.js           optional generative backend (custom endpoint / Replicate)
+    remote.js           which AI backend a request goes to, and the two older transports
+    aiage.js            crops each face, calls the model, composites the result back
   export/exporters.js   PNG, JPEG, WebP, PDF, SVG, video, project files
   ui/                   modal primitives, panels, the age and export dialogs
+worker/                 Cloudflare Worker: the shared key pool behind the AI engine
 scripts/
   sync-wasm.mjs         copies the MediaPipe runtime out of node_modules into public/
   make-icons.mjs        renders the PWA icons from code — no binary assets to maintain

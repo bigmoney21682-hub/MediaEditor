@@ -1,0 +1,42 @@
+name = "mediaeditor-proxy"
+main = "index.js"
+compatibility_date = "2026-07-31"
+
+# The origins allowed to call this proxy. Anything else gets a 403 rather than
+# an opaque CORS failure.
+#
+# Worth being honest about what this is: it stops *other websites* from
+# spending the pool through a visitor's browser, which is the attack a browser
+# can actually mount. It stops nothing from curl, which sets any Origin it
+# likes. The daily cap is the limit that holds against a script.
+#
+# Local entries are this app's own dev server (5290) and vite preview (5291).
+# Both http and https, and 127.0.0.1 alongside localhost, because the browser
+# treats them as different origins. Never set this to "*".
+[vars]
+ALLOWED_ORIGIN = "https://bigmoney21682-hub.github.io,http://localhost:5290,http://127.0.0.1:5290,https://localhost:5290,http://localhost:5291,http://127.0.0.1:5291,https://localhost:5291"
+
+# Image generation costs far more per request than the analyzers' text
+# answers, and one transform of a group photo is one request per face — hence
+# 15 rather than their 40.
+DAILY_CAP = "15"
+
+# Per-IP request counters. Without this binding there is no cap at all, which
+# is fine for a private URL and not fine for a published one. The namespace
+# title is per-account, hence the app-specific name; the binding the Worker
+# reads is always RATE_LIMIT. Each app counts separately, so a viewer gets a
+# full allowance here rather than one pooled across all four.
+#   npx wrangler kv namespace create RATE_LIMIT
+# Paste the id it prints below, then uncomment.
+# [[kv_namespaces]]
+# binding = "RATE_LIMIT"
+# id = "PASTE_THE_ID_WRANGLER_PRINTS"
+
+# The key pool is a secret, deliberately absent from this file: a comma- or
+# newline-separated list. The Worker rotates across it, so one key running out
+# of free quota does not take the shared link down.
+#   npx wrangler secret put GEMINI_KEYS   # AIza...,AIza...
+#
+# APP_TOKEN is optional. Set it and the app must send a matching passphrase;
+# leave it unset and the origin allowlist plus DAILY_CAP are the only limits.
+#   npx wrangler secret put APP_TOKEN

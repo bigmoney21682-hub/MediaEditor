@@ -1,51 +1,119 @@
 /**
- * Optional AI backend for photoreal age transforms.
+ * The AI backends for the age transform, and which one a request goes to.
  *
- * The offline engine in `age.js` simulates ageing; a generative model actually
- * re-synthesises the face. Nothing here runs unless the user configures it, and
- * the settings (including the key) live only in this browser's localStorage.
+ * The offline engine in `age.js` simulates ageing; a generative model
+ * re-synthesises the face. Nothing here runs unless the user picks the AI
+ * engine and consents to the upload, and every setting — keys included — lives
+ * only in this browser.
  *
- * Two shapes are supported:
+ * Three backends:
+ *   gemini     — the stack the analyzer apps use: the viewer's own Google key
+ *                first, then their proxy, then the shared Worker, with model
+ *                and credential fallback under all of it. See ai/.
  *   custom     — your own endpoint. POST {image, years, direction} -> {image}
- *   replicate  — api.replicate.com directly, or through your own proxy origin
+ *   replicate  — api.replicate.com, directly or through a relay of your own
  *
- * Note on CORS: browsers can only call an endpoint that returns permissive CORS
- * headers. Replicate does not, so `proxy` should point at a small relay you run.
- * There is a 20-line example in the README.
+ * Note on CORS: a browser can only call an endpoint that returns permissive
+ * CORS headers. Google does; Replicate does not, which is why `proxy` exists
+ * on that option and why the shared Worker exists at all.
  */
 
+import { copyCanvas, clamp, loadImage } from '../util.js';
+import { aiAgeTransform } from './aiage.js';
+import { reachable, apiKeyStore, proxyStore, sharedProxyStore, usingProxy } from '../ai/proxy.js';
+
 const KEY = 'mediaeditor.ai';
+const KEY_CONSENT = 'me.ai.consent';
+
+const DEFAULTS = { provider: 'gemini', endpoint: '', token: '', model: '', proxy: '' };
 
 export function getConfig() {
   try {
-    return { provider: 'none', endpoint: '', token: '', model: '', proxy: '', ...JSON.parse(localStorage.getItem(KEY) || '{}') };
+    return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(KEY) || '{}') };
   } catch {
-    return { provider: 'none', endpoint: '', token: '', model: '', proxy: '' };
+    return { ...DEFAULTS };
   }
 }
 
 export function setConfig(cfg) {
-  localStorage.setItem(KEY, JSON.stringify({ ...getConfig(), ...cfg }));
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ ...getConfig(), ...cfg }));
+  } catch { /* private mode: the session keeps working, the settings do not persist */ }
 }
-
-export const isConfigured = () => {
-  const c = getConfig();
-  return (c.provider === 'custom' && !!c.endpoint) || (c.provider === 'replicate' && !!c.token && !!c.model);
-};
 
 /**
- * @param {string} dataUrl  source image as a data: URL
- * @param {{years:number, direction:string}} opts
- * @returns {Promise<string>} resulting image as a data: or https: URL
+ * Uploading a photograph of someone's face to a third party is a decision with
+ * real consequences, so it gets made once, deliberately, rather than buried in
+ * a hint nobody reads. The on-device engine needs no consent because nothing
+ * leaves the machine.
  */
-export async function remoteAge(dataUrl, { years, direction, signal, onStatus = () => {} }) {
-  const cfg = getConfig();
-  if (cfg.provider === 'custom') return viaCustom(cfg, dataUrl, years, direction, signal, onStatus);
-  if (cfg.provider === 'replicate') return viaReplicate(cfg, dataUrl, years, direction, signal, onStatus);
-  throw new Error('No AI backend is configured.');
+export const consent = {
+  get: () => {
+    try { return localStorage.getItem(KEY_CONSENT) === '1'; } catch { return false; }
+  },
+  set: (v) => {
+    try {
+      if (v) localStorage.setItem(KEY_CONSENT, '1');
+      else localStorage.removeItem(KEY_CONSENT);
+    } catch { /* ignore */ }
+  }
+};
+
+/** Whether the selected backend has everything it needs to run. */
+export function isConfigured() {
+  const c = getConfig();
+  if (c.provider === 'gemini') return reachable(apiKeyStore.get());
+  if (c.provider === 'custom') return !!c.endpoint;
+  if (c.provider === 'replicate') return !!c.token && !!c.model;
+  return false;
 }
 
-async function viaCustom(cfg, image, years, direction, signal, onStatus) {
+/** One line for the dialog: what a request would actually use. */
+export function describeBackend() {
+  const c = getConfig();
+  if (c.provider === 'gemini') {
+    if (apiKeyStore.get()) return 'Google, with your own key' + (usingProxy() ? ', falling back to the proxy' : '');
+    if (proxyStore.get().url) return 'your proxy';
+    if (sharedProxyStore.get()) return 'the shared service';
+    return 'nothing yet — add a key or turn the shared service on';
+  }
+  if (c.provider === 'custom') return c.endpoint || 'your endpoint (not set)';
+  if (c.provider === 'replicate') return 'Replicate' + (c.proxy ? ', through your relay' : '');
+  return 'the on-device engine only';
+}
+
+/**
+ * Runs the configured backend and returns a canvas the size of `source`.
+ *
+ * Everything downstream of this — the layer, the history entry, the export —
+ * wants a canvas matching the document, so the three backends converge here
+ * rather than each in the dialog.
+ */
+export async function runAI(source, opts) {
+  const cfg = getConfig();
+
+  if (cfg.provider === 'gemini') return aiAgeTransform(source, opts);
+
+  const image = source.toDataURL('image/jpeg', 0.94);
+  const url =
+    cfg.provider === 'custom'
+      ? await viaCustom(cfg, image, opts)
+      : cfg.provider === 'replicate'
+        ? await viaReplicate(cfg, image, opts)
+        : null;
+  if (!url) throw new Error('No AI backend is configured.');
+
+  const img = await loadImage(url);
+  const out = copyCanvas(source);
+  const ox = out.getContext('2d');
+  ox.save();
+  ox.globalAlpha = clamp(opts.strength ?? 1, 0, 1);
+  ox.drawImage(img, 0, 0, out.width, out.height);
+  ox.restore();
+  return out;
+}
+
+async function viaCustom(cfg, image, { years, direction, signal, onStatus = () => {} }) {
   onStatus('Contacting your endpoint…');
   const res = await fetch(cfg.endpoint, {
     method: 'POST',
@@ -60,12 +128,10 @@ async function viaCustom(cfg, image, years, direction, signal, onStatus) {
   return Array.isArray(out) ? out[0] : out;
 }
 
-async function viaReplicate(cfg, image, years, direction, signal, onStatus) {
+async function viaReplicate(cfg, image, { years, direction, signal, onStatus = () => {} }) {
   const base = (cfg.proxy || 'https://api.replicate.com').replace(/\/$/, '');
-  const headers = {
-    'content-type': 'application/json',
-    authorization: `Bearer ${cfg.token}`
-  };
+  const headers = { 'content-type': 'application/json', authorization: `Bearer ${cfg.token}` };
+
   onStatus('Queuing prediction…');
   const create = await fetch(`${base}/v1/predictions`, {
     method: 'POST',
