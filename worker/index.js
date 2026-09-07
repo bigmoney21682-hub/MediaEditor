@@ -309,11 +309,15 @@ export default {
 
     const { up, path } = resolveUpstream(url.pathname)
 
-    const keys = keyPool(up, env)
-    if (!keys.length) return fail(500, `The proxy has no ${up.label} secret set.`, request, env)
-
+    // Allowlist first. It is the control that keeps a leaked URL from being an
+    // open relay, so it should not sit behind a check that can mask it — with
+    // the pool unset, every path answered "no GEMINI_KEYS secret" and there
+    // was no way to see whether the allowlist worked at all.
     if (!up.paths.some((re) => re.test(path)))
       return fail(404, `This proxy does not forward ${url.pathname}.`, request, env)
+
+    const keys = keyPool(up, env)
+    if (!keys.length) return fail(500, `The proxy has no ${up.label} secret set.`, request, env)
 
     const quota = await spendQuota(request, env)
     if (!quota.allowed)

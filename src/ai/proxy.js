@@ -33,7 +33,7 @@
  * scripted abuse of the URL. The real limits are the Worker's origin allowlist
  * and its per-IP daily cap.
  */
-const SHARED_PROXY_URL = 'https://mediaeditor-proxy.bigmoney21682.workers.dev';
+const SHARED_PROXY_URL = 'https://mediaeditor-proxy.4ysffsct6b.workers.dev';
 const SHARED_PROXY_TOKEN = '';
 
 const KEY_URL = 'me.proxy.url';
