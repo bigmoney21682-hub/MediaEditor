@@ -21,8 +21,12 @@ export const tools = {
 
 export const crop = { active: false, rect: null, aspect: 0 };  // aspect 0 = free
 
-/** Lasso cut-out: `points` is the drawn outline in doc space, applied to `layerId`. */
-export const cut = { points: null, layerId: null, drawing: false, mode: 'keep', feather: 2, newLayer: false };
+/**
+ * Lasso cut-out: `points` is the drawn outline in doc space, applied to `layerId`.
+ * The outline can be traced in several strokes (`strokes` holds where each
+ * began), so you can pinch-zoom between them; `cursor` feeds the magnifier.
+ */
+export const cut = { points: null, strokes: [], layerId: null, drawing: false, cursor: null, mode: 'keep', feather: 2, newLayer: false };
 
 let el = null;
 let onToolChange = () => {};
@@ -119,8 +123,8 @@ function onDown(e) {
   pointers.set(e.pointerId, localPoint(e));
 
   if (pointers.size === 2) {
-    // A second finger means zoom, not a half-drawn lasso.
-    if (drag?.kind === 'lasso') clearCut();
+    // A second finger means zoom: drop the stroke it interrupted, keep the rest.
+    if (drag?.kind === 'lasso') { cut.drawing = false; cut.cursor = null; undoCutStroke(); }
     startPinch(); drag = null; return;
   }
   if (pointers.size > 2) return;
@@ -196,6 +200,7 @@ function onUp(e) {
   if (drag.kind === 'paint' && drag.ctx) drag.ctx.restore();
   if (drag.kind === 'lasso') {
     cut.drawing = false;
+    cut.cursor = null;
     if (cut.points.length < 3) clearCut();
     emit('cut');
   }
@@ -723,9 +728,17 @@ function startLasso(p, d) {
     return;
   }
   if (doc.selection !== target.id) { doc.selection = target.id; emit('layers'); }
-  cut.layerId = target.id;
-  cut.points = [d];
+  if (cut.points && cut.layerId === target.id) {
+    // Carry on the outline from where the last stroke stopped.
+    cut.strokes.push(cut.points.length);
+    cut.points.push(d);
+  } else {
+    cut.layerId = target.id;
+    cut.points = [d];
+    cut.strokes = [0];
+  }
   cut.drawing = true;
+  cut.cursor = p;
   drag = { kind: 'lasso', last: p };
   emit('cut');
 }
@@ -736,14 +749,26 @@ function hitLayerAt(l, d) {
 }
 
 function lassoTo(p, d) {
+  cut.cursor = p;
   // Thin the path on screen distance so slow fingers don't pile up points.
   if (Math.hypot(p.x - drag.last.x, p.y - drag.last.y) < 3) return;
   drag.last = p;
   cut.points.push(d);
 }
 
+/** Take back the most recent stroke of the outline. */
+export function undoCutStroke() {
+  if (!cut.points) return;
+  cut.points.length = cut.strokes.pop() ?? 0;
+  if (cut.points.length < 3) return clearCut();
+  emit('cut');
+  requestRender();
+}
+
 export function clearCut() {
   cut.points = null;
+  cut.strokes = [];
+  cut.cursor = null;
   cut.layerId = null;
   cut.drawing = false;
   emit('cut');
@@ -862,7 +887,7 @@ function drawCutOverlay(ctx) {
   const trace = () => {
     ctx.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-    ctx.closePath();
+    if (!cut.drawing) ctx.closePath();
   };
   if (!cut.drawing) {
     // Preview what goes away.
@@ -881,5 +906,57 @@ function drawCutOverlay(ctx) {
   ctx.setLineDash([6, 5]);
   ctx.strokeStyle = '#fff';
   ctx.beginPath(); trace(); ctx.stroke();
+  if (cut.drawing) {
+    // Where the outline will close once you let go.
+    const a = pts[pts.length - 1], b = pts[0];
+    ctx.setLineDash([3, 5]);
+    ctx.strokeStyle = 'rgba(255,255,255,.45)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  }
+  ctx.restore();
+  if (cut.drawing && cut.cursor) drawLoupe(ctx, cut.cursor);
+}
+
+/**
+ * Magnifier bubble clear of the finger, showing what's underneath it —
+ * a fingertip hides exactly the edge you're trying to follow.
+ */
+function drawLoupe(ctx, p) {
+  const R = 58, MAG = 3, GAP = 42;
+  const k = ctx.getTransform().a || 1;          // device pixels per CSS pixel
+  const cssW = ctx.canvas.width / k;
+  let lx = clamp(p.x, R + 6, cssW - R - 6);
+  let ly = p.y - R - GAP;
+  if (ly - R < 6) ly = p.y + R + GAP;           // no room above: go below
+  const S = (R * 2) / MAG;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(lx, ly, R, 0, Math.PI * 2);
+  ctx.save();
+  ctx.clip();
+  ctx.fillStyle = '#0b0d12';
+  ctx.fillRect(lx - R, ly - R, R * 2, R * 2);
+  ctx.imageSmoothingQuality = 'high';
+  // The screen canvas already holds the photo and the outline so far; copy a
+  // small patch of it back up, enlarged.
+  ctx.drawImage(ctx.canvas, (p.x - S / 2) * k, (p.y - S / 2) * k, S * k, S * k, lx - R, ly - R, R * 2, R * 2);
+  ctx.restore();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(0,0,0,.6)';
+  ctx.stroke();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = '#fff';
+  ctx.stroke();
+  // Crosshair on the exact point being traced.
+  ctx.beginPath();
+  ctx.moveTo(lx - 9, ly); ctx.lineTo(lx - 3, ly);
+  ctx.moveTo(lx + 3, ly); ctx.lineTo(lx + 9, ly);
+  ctx.moveTo(lx, ly - 9); ctx.lineTo(lx, ly - 3);
+  ctx.moveTo(lx, ly + 3); ctx.lineTo(lx, ly + 9);
+  ctx.strokeStyle = '#ff4d6d';
+  ctx.lineWidth = 2;
+  ctx.stroke();
   ctx.restore();
 }

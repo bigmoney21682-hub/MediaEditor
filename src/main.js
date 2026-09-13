@@ -4,7 +4,7 @@ import {
   pushHistory, undo, redo, canUndo, canRedo, selected, removeLayer, clearHistory, moveLayer
 } from './state.js';
 import { attach, requestRender, fitView, zoomAt, stageSize, drawLayer, renderDoc } from './render.js';
-import { initTools, setTool, tools, crop, endCrop, beginCrop, commitText, cut, cutReady, applyCut, clearCut } from './tools.js';
+import { initTools, setTool, tools, crop, endCrop, beginCrop, commitText, cut, cutReady, applyCut, clearCut, undoCutStroke } from './tools.js';
 import { renderAll, renderToolOptions, renderLayers, renderLayerOptions, setPlaceHandler, setLayerDrawer } from './ui/panels.js';
 import { openAgeDialog } from './ui/agedialog.js';
 import { openExportDialog } from './ui/exportdialog.js';
@@ -139,6 +139,7 @@ $('crop-apply').addEventListener('click', () => { endCrop(true); setTool('select
 $('crop-cancel').addEventListener('click', () => { endCrop(false); setTool('select'); });
 $('cut-apply').addEventListener('click', () => applyCut());
 $('cut-cancel').addEventListener('click', () => clearCut());
+$('cut-back').addEventListener('click', () => undoCutStroke());
 
 /* ------------------------------------------------------------------ zoom */
 
@@ -218,6 +219,7 @@ window.addEventListener('keydown', (e) => {
   if (tools.current === 'cut' && cut.points) {
     if (e.key === 'Enter' && cutReady()) { e.preventDefault(); applyCut(); return; }
     if (e.key === 'Escape') { e.preventDefault(); clearCut(); return; }
+    if (e.key === 'Backspace') { e.preventDefault(); undoCutStroke(); return; }
   }
 
   if ((e.key === 'Delete' || e.key === 'Backspace') && selected()) {

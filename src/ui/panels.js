@@ -3,7 +3,7 @@ import {
   addLayer, makeDrawLayer, beforePixels
 } from '../state.js';
 import { requestRender, measureText } from '../render.js';
-import { tools, setTool, crop, setCropAspect, endCrop, editText, cut, cutReady, applyCut, clearCut } from '../tools.js';
+import { tools, setTool, crop, setCropAspect, endCrop, editText, cut, cutReady, applyCut, clearCut, undoCutStroke } from '../tools.js';
 import { el, row, slider, segmented } from './modal.js';
 import { copyCanvas, makeCanvas, toast } from '../util.js';
 
@@ -131,10 +131,11 @@ export function renderToolOptions() {
     if (cutReady()) {
       host.append(el('div', { class: 'chips', style: { margin: '4px 0 8px' } },
         el('button', { class: 'btn primary', onclick: () => applyCut() }, '✂ Cut'),
-        el('button', { class: 'btn', onclick: () => clearCut() }, 'Redraw')));
+        el('button', { class: 'btn', onclick: () => undoCutStroke() }, '↶ Back'),
+        el('button', { class: 'btn', onclick: () => clearCut() }, 'Clear')));
     }
     host.append(el('div', { class: 'hint' },
-      'Trace around the person or object with your finger — the outline closes itself. Then press Cut: everything else becomes transparent and the layer shrinks to fit. For a collage, open a background, add photos with Image, and cut each one out.'));
+      'Trace around the person or object — the magnifier shows the edge under your finger. Pinch to zoom in and trace in pieces: each new stroke carries on the outline, and Back undoes the last one. Press Cut when you\'re round: everything else becomes transparent. For a collage, add photos with Image and cut each one out.'));
     return;
   }
 
