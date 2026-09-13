@@ -30,6 +30,7 @@ npm run preview    # serve the built bundle on http://127.0.0.1:5291
 | Eraser | `E` | Erases within the selected layer only |
 | Rect / Ellipse / Line | `R` `O` `L` | Fill, stroke, corner radius, dashes, arrowheads |
 | Text | `T` | Edited in place on the canvas; font, size, weight, alignment, outline |
+| Cut | `X` | **Remove background** finds people automatically; tap an object to pick it out; or trace an outline (with magnifier, pinch-zoom between strokes). The layer is trimmed to the subject, ready for collages |
 | Image | `I` | Adds another photo as a layer — or drag files in, or paste with `⌘V` |
 
 Layers reorder by dragging, and carry opacity, all 16 canvas blend modes, lock and visibility.
@@ -147,6 +148,8 @@ your own; the *Relay* field takes its origin. Keep the token on the relay rather
 | MP4 / WebM | Ken Burns, pan, layer build-up, or a before/after dissolve of your edit |
 | Project | `.mediaeditor.json` — the whole layer stack, re-openable here |
 
+On a phone, **Save to Photos** hands the image to the share sheet, where *Save Image* puts it in the camera roll.
+
 Video is recorded live through `MediaRecorder`, preferring H.264 MP4 and falling back to WebM on
 browsers without it. The animation is driven by elapsed wall-clock time rather than a frame counter,
 so the clip comes out the length you asked for even if a frame runs long — keep the tab visible while
@@ -157,7 +160,8 @@ it records.
 The app shell and the 3.6 MB landmark model are precached, so the editor and face detection work
 offline from the moment the service worker installs. The 11 MB MediaPipe WebAssembly runtime is
 cached on first use instead of up front, which keeps the install light — run the age transform once
-while online and it is available offline from then on.
+while online and it is available offline from then on. The background-removal models (16 MB for
+people, 6 MB for tapped objects) are fetched and cached the same way, the first time each is used.
 
 ## Deploying
 
@@ -194,6 +198,7 @@ src/
     age.js              the age pipeline: geometry, creases, texture, colour, hair
     remote.js           which AI backend a request goes to, and the two older transports
     aiage.js            crops each face, calls the model, composites the result back
+  segment/segment.js    background removal: people segmenter and tap-an-object segmenter → masks
   export/exporters.js   PNG, JPEG, WebP, PDF, SVG, video, project files
   ui/                   modal primitives, panels, the age and export dialogs
 worker/                 Cloudflare Worker: the shared key pool behind the AI engine

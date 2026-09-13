@@ -26,7 +26,11 @@ export const crop = { active: false, rect: null, aspect: 0 };  // aspect 0 = fre
  * The outline can be traced in several strokes (`strokes` holds where each
  * began), so you can pinch-zoom between them; `cursor` feeds the magnifier.
  */
-export const cut = { points: null, strokes: [], layerId: null, drawing: false, cursor: null, mode: 'keep', feather: 2, newLayer: false };
+export const cut = {
+  points: null, strokes: [], layerId: null, drawing: false, cursor: null,
+  mask: null, maskBox: null, busy: false,      // automatic selection, in layer pixels
+  mode: 'keep', feather: 2, newLayer: false
+};
 
 let el = null;
 let onToolChange = () => {};
@@ -201,7 +205,14 @@ function onUp(e) {
   if (drag.kind === 'lasso') {
     cut.drawing = false;
     cut.cursor = null;
-    if (cut.points.length < 3) clearCut();
+    if (cut.points.length < 3) {
+      // A tap, not a trace: on a fresh outline it means "cut out the thing I tapped".
+      const d = cut.points[cut.points.length - 1];
+      const fresh = cut.strokes.length <= 1;
+      const layer = layerById(cut.layerId);
+      if (fresh) { clearCut(); if (layer) autoCut({ kind: 'object', layer, at: d }); }
+      else undoCutStroke();
+    }
     emit('cut');
   }
   // A tap (no drag) on an object is a request to edit it.
@@ -714,15 +725,21 @@ function drawCropOverlay(ctx) {
 
 const isRaster = (l) => l && l.canvas && l.visible;
 
-function startLasso(p, d) {
-  let target = selected();
-  if (!isRaster(target) || target.locked) {
-    target = null;
-    for (let i = doc.layers.length - 1; i >= 0; i--) {
-      const l = doc.layers[i];
-      if (isRaster(l) && !l.locked && hitLayerAt(l, d)) { target = l; break; }
-    }
+/** Layer a cut applies to: the selected photo/drawing, else the topmost one (under `d`, if given). */
+function cutTarget(d) {
+  const cur = selected();
+  if (isRaster(cur) && !cur.locked && (!d || hitLayerAt(cur, d))) return cur;
+  for (let i = doc.layers.length - 1; i >= 0; i--) {
+    const l = doc.layers[i];
+    if (isRaster(l) && !l.locked && (d ? hitLayerAt(l, d) : l.kind === 'image')) return l;
   }
+  return isRaster(cur) && !cur.locked ? cur : null;
+}
+
+function startLasso(p, d) {
+  if (cut.busy) return;
+  if (cut.mask) clearCut();          // tracing replaces an automatic selection
+  const target = cutTarget(d);
   if (!target) {
     toast('Start the outline on a photo or drawing layer.', 'err');
     return;
@@ -771,11 +788,64 @@ export function clearCut() {
   cut.cursor = null;
   cut.layerId = null;
   cut.drawing = false;
+  cut.mask = null;
+  cut.maskBox = null;
+  shade = null;
   emit('cut');
   requestRender();
 }
 
-export const cutReady = () => !!(cut.points && cut.points.length >= 3 && !cut.drawing && layerById(cut.layerId));
+export const cutReady = () =>
+  !!(((cut.points && cut.points.length >= 3 && !cut.drawing) || cut.mask) && layerById(cut.layerId));
+
+/**
+ * Select the subject automatically — no tracing. 'person' finds every person
+ * in the photo (falling back to whatever sits in the middle when there's
+ * nobody); 'object' picks out the thing at doc point `at`.
+ * The result is a preview: Cut applies it, like a traced outline.
+ */
+export async function autoCut({ kind = 'person', layer = cutTarget(), at = null } = {}) {
+  if (cut.busy) return;
+  if (!layer) return toast('Open a photo first, then select its layer.', 'err');
+  const seg = await import('./segment/segment.js');
+  clearCut();
+  cut.busy = true;
+  emit('cut');
+  const first = seg.needsDownload(kind);
+  toast(kind === 'person'
+    ? (first ? 'Finding people… (first use downloads the 16 MB model)' : 'Finding people…')
+    : (first ? 'Finding that object… (first use downloads a 6 MB model)' : 'Finding that object…'));
+  try {
+    let mask = null;
+    if (kind === 'person') {
+      mask = await seg.segmentPeople(layer.canvas);
+      if (!mask) {
+        toast('No person found — picking out the main object instead.');
+        mask = await seg.segmentObjectAt(layer.canvas, 0.5, 0.5);
+      }
+    } else {
+      const q = toLocal(layer, at.x, at.y);
+      mask = await seg.segmentObjectAt(layer.canvas, clamp(q.x / layer.w, 0, 1), clamp(q.y / layer.h, 0, 1));
+    }
+    const box = mask && seg.maskBounds(mask);
+    if (!box) {
+      toast(kind === 'person'
+        ? 'Couldn\'t find a subject. Try tapping it, or trace around it.'
+        : 'Couldn\'t pick out anything there. Tap nearer its middle, or trace around it.', 'err');
+      return;
+    }
+    cut.layerId = layer.id;
+    cut.mask = mask;
+    cut.maskBox = box;
+    if (doc.selection !== layer.id) { doc.selection = layer.id; emit('layers'); }
+  } catch (e) {
+    toast('Background removal failed: ' + e.message, 'err');
+  } finally {
+    cut.busy = false;
+    emit('cut');
+    requestRender();
+  }
+}
 
 /**
  * Apply the lasso to its layer: pixels outside the outline (or inside, in
@@ -795,6 +865,50 @@ export function applyCut() {
 
   const cw = l.canvas.width, ch = l.canvas.height;
   const sx = cw / l.w, sy = ch / l.h;
+  const { mask, box: keptBox } = cut.mask ? { mask: cut.mask, box: cut.maskBox } : lassoMask(l, sx, sy);
+
+  const out = makeCanvas(cw, ch);
+  const o = out.getContext('2d');
+  o.drawImage(l.canvas, 0, 0);
+  o.globalCompositeOperation = cut.mode === 'remove' ? 'destination-out' : 'destination-in';
+  o.drawImage(mask, 0, 0, cw, ch);
+
+  // Trim to the kept region (keep mode only — removing leaves the frame as is).
+  let box = { x: 0, y: 0, w: cw, h: ch };
+  if (cut.mode !== 'remove') {
+    if (!keptBox) {
+      toast('The outline missed the layer — nothing to keep.', 'err');
+      if (cut.newLayer) doc.layers.splice(doc.layers.indexOf(l), 1);
+      clearCut();
+      emit('all');
+      return;
+    }
+    box = keptBox;
+  }
+  const trimmed = makeCanvas(box.w, box.h);
+  trimmed.getContext('2d').drawImage(out, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
+
+  // Re-place the smaller box so the kept pixels don't move on screen, rotation included.
+  const lw = box.w / sx, lh = box.h / sy;
+  const dx = box.x / sx + lw / 2 - l.w / 2, dy = box.y / sy + lh / 2 - l.h / 2;
+  const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+  const c = rotatePoint(cx + dx, cy + dy, cx, cy, l.rot);
+  l.canvas = trimmed;
+  l._shared = false;
+  l.w = lw; l.h = lh;
+  l.x = c.x - lw / 2; l.y = c.y - lh / 2;
+
+  doc.selection = l.id;
+  clearCut();
+  setTool('select');
+  toast('Cut out. Drag it into place — add more photos with Image to build a collage.', 'ok');
+  emit('all');
+  requestRender();
+}
+
+
+function lassoMask(l, sx, sy) {
+  const cw = l.canvas.width, ch = l.canvas.height;
   // Outline in the layer's own pixel space.
   const pts = cut.points.map((d) => { const q = toLocal(l, d.x, d.y); return { x: q.x * sx, y: q.y * sy }; });
   const feather = cut.feather * Math.max(sx, sy);
@@ -823,53 +937,42 @@ export function applyCut() {
     m.fill();
   }
 
-  const out = makeCanvas(cw, ch);
-  const o = out.getContext('2d');
-  o.drawImage(l.canvas, 0, 0);
-  o.globalCompositeOperation = cut.mode === 'remove' ? 'destination-out' : 'destination-in';
-  o.drawImage(mask, 0, 0);
+  const pad = Math.ceil(feather * 1.5);
+  const x0 = clamp(Math.floor(Math.min(...pts.map((q) => q.x)) - pad), 0, cw);
+  const y0 = clamp(Math.floor(Math.min(...pts.map((q) => q.y)) - pad), 0, ch);
+  const x1 = clamp(Math.ceil(Math.max(...pts.map((q) => q.x)) + pad), 0, cw);
+  const y1 = clamp(Math.ceil(Math.max(...pts.map((q) => q.y)) + pad), 0, ch);
+  const box = x1 - x0 < 1 || y1 - y0 < 1 ? null : { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  return { mask, box };
+}
 
-  // Trim to the kept region (keep mode only — removing leaves the frame as is).
-  let box = { x: 0, y: 0, w: cw, h: ch };
-  if (cut.mode !== 'remove') {
-    const pad = Math.ceil(feather * 1.5);
-    const x0 = clamp(Math.floor(Math.min(...pts.map((q) => q.x)) - pad), 0, cw);
-    const y0 = clamp(Math.floor(Math.min(...pts.map((q) => q.y)) - pad), 0, ch);
-    const x1 = clamp(Math.ceil(Math.max(...pts.map((q) => q.x)) + pad), 0, cw);
-    const y1 = clamp(Math.ceil(Math.max(...pts.map((q) => q.y)) + pad), 0, ch);
-    if (x1 - x0 < 1 || y1 - y0 < 1) {
-      toast('The outline missed the layer — nothing to keep.', 'err');
-      if (cut.newLayer) doc.layers.splice(doc.layers.indexOf(l), 1);
-      clearCut();
-      emit('all');
-      return;
-    }
-    box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+let shade = null;   // { mask, mode, canvas } — dimmed preview of an automatic selection
+
+/** Darken what the automatic selection would remove, drawn in the layer's own frame. */
+function drawMaskPreview(ctx, l) {
+  if (!shade || shade.mask !== cut.mask || shade.mode !== cut.mode) {
+    // Preview at a modest size; it's only for looking at.
+    const k = Math.min(1, 1024 / Math.max(cut.mask.width, cut.mask.height));
+    const c = makeCanvas(Math.round(cut.mask.width * k), Math.round(cut.mask.height * k));
+    const g = c.getContext('2d');
+    g.fillStyle = 'rgba(8,10,15,.7)';
+    g.fillRect(0, 0, c.width, c.height);
+    g.globalCompositeOperation = cut.mode === 'remove' ? 'destination-in' : 'destination-out';
+    g.drawImage(cut.mask, 0, 0, c.width, c.height);
+    shade = { mask: cut.mask, mode: cut.mode, canvas: c };
   }
-
-  const trimmed = makeCanvas(box.w, box.h);
-  trimmed.getContext('2d').drawImage(out, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
-
-  // Re-place the smaller box so the kept pixels don't move on screen, rotation included.
-  const lw = box.w / sx, lh = box.h / sy;
-  const dx = box.x / sx + lw / 2 - l.w / 2, dy = box.y / sy + lh / 2 - l.h / 2;
-  const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
-  const c = rotatePoint(cx + dx, cy + dy, cx, cy, l.rot);
-  l.canvas = trimmed;
-  l._shared = false;
-  l.w = lw; l.h = lh;
-  l.x = c.x - lw / 2; l.y = c.y - lh / 2;
-
-  doc.selection = l.id;
-  clearCut();
-  setTool('select');
-  toast('Cut out. Drag it into place — add more photos with Image to build a collage.', 'ok');
-  emit('all');
-  requestRender();
+  ctx.save();
+  ctx.translate(view.x, view.y);
+  ctx.scale(view.zoom, view.zoom);
+  ctx.translate(l.x + l.w / 2, l.y + l.h / 2);
+  ctx.rotate(l.rot);
+  ctx.drawImage(shade.canvas, -l.w / 2, -l.h / 2, l.w, l.h);
+  ctx.restore();
 }
 
 function drawCutOverlay(ctx) {
   const l = layerById(cut.layerId) || (isRaster(selected()) ? selected() : null);
+  if (l && cut.mask && cut.layerId === l.id) drawMaskPreview(ctx, l);
   ctx.save();
   if (l) {
     const c = layerCorners(l).map((q) => toScreen(q.x, q.y));

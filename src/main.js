@@ -258,6 +258,7 @@ onChange((what) => {
   $('zoom-label').textContent = Math.round(view.zoom * 100) + '%';
   $('crop-actions').hidden = !crop.active;
   $('cut-actions').hidden = !cutReady();
+  $('cut-back').hidden = !!cut.mask;
   if (what === 'view') return;
   if (what === 'crop' || what === 'cut') { renderToolOptions(); return; }
   if (what === 'layers') { renderLayers(); renderLayerOptions(); return; }

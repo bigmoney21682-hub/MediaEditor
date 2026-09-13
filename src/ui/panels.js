@@ -3,7 +3,7 @@ import {
   addLayer, makeDrawLayer, beforePixels
 } from '../state.js';
 import { requestRender, measureText } from '../render.js';
-import { tools, setTool, crop, setCropAspect, endCrop, editText, cut, cutReady, applyCut, clearCut, undoCutStroke } from '../tools.js';
+import { tools, setTool, crop, setCropAspect, endCrop, editText, cut, cutReady, applyCut, clearCut, undoCutStroke, autoCut } from '../tools.js';
 import { el, row, slider, segmented } from './modal.js';
 import { copyCanvas, makeCanvas, toast } from '../util.js';
 
@@ -122,6 +122,11 @@ export function renderToolOptions() {
   }
 
   if (t === 'cut') {
+    const auto = el('button', { class: 'btn primary', style: { width: '100%', marginBottom: '6px' }, onclick: () => autoCut({ kind: 'person' }) },
+      cut.busy ? 'Working…' : '✨ Remove background');
+    auto.disabled = cut.busy;
+    host.append(auto, el('div', { class: 'hint', style: { marginBottom: '10px' } },
+      'Finds the people in the selected photo automatically. For an object instead, just tap it on the canvas.'));
     host.append(row('Keep', segmented([['keep', 'Inside'], ['remove', 'Outside']], cut.mode, (v) => { cut.mode = v; requestRender(); })));
     host.append(slider('Soft edge', { min: 0, max: 30, value: cut.feather, format: (v) => v + 'px', onInput: (v) => (cut.feather = v) }));
     const copy = el('input', { type: 'checkbox' });
@@ -131,11 +136,11 @@ export function renderToolOptions() {
     if (cutReady()) {
       host.append(el('div', { class: 'chips', style: { margin: '4px 0 8px' } },
         el('button', { class: 'btn primary', onclick: () => applyCut() }, '✂ Cut'),
-        el('button', { class: 'btn', onclick: () => undoCutStroke() }, '↶ Back'),
+        cut.mask ? null : el('button', { class: 'btn', onclick: () => undoCutStroke() }, '↶ Back'),
         el('button', { class: 'btn', onclick: () => clearCut() }, 'Clear')));
     }
     host.append(el('div', { class: 'hint' },
-      'Trace around the person or object — the magnifier shows the edge under your finger. Pinch to zoom in and trace in pieces: each new stroke carries on the outline, and Back undoes the last one. Press Cut when you\'re round: everything else becomes transparent. For a collage, add photos with Image and cut each one out.'));
+      'Or trace around it yourself — the magnifier shows the edge under your finger. Pinch to zoom in and trace in pieces: each new stroke carries on the outline, and Back undoes the last one. Press Cut when you\'re round: everything else becomes transparent. For a collage, add photos with Image and cut each one out.'));
     return;
   }
 
