@@ -6,7 +6,7 @@ import {
   toDoc, toScreen, layerCorners, toLocal, pickLayer, requestRender, setOverlay,
   zoomAt, measureText, textFont, textLines
 } from './render.js';
-import { clamp, rotatePoint, rad, deg } from './util.js';
+import { clamp, rotatePoint, rad, deg, makeCanvas, toast } from './util.js';
 
 export const tools = {
   current: 'select',
@@ -21,8 +21,12 @@ export const tools = {
 
 export const crop = { active: false, rect: null, aspect: 0 };  // aspect 0 = free
 
+/** Lasso cut-out: `points` is the drawn outline in doc space, applied to `layerId`. */
+export const cut = { points: null, layerId: null, drawing: false, mode: 'keep', feather: 2, newLayer: false };
+
 let el = null;
 let onToolChange = () => {};
+let onSelectTap = () => {};
 const pointers = new Map();
 let drag = null;          // active gesture
 let pinch = null;
@@ -34,6 +38,7 @@ const HANDLE_HIT = 11;
 export function initTools(canvasEl, hooks = {}) {
   el = canvasEl;
   onToolChange = hooks.onToolChange || (() => {});
+  onSelectTap = hooks.onSelectTap || (() => {});
   el.addEventListener('pointerdown', onDown);
   el.addEventListener('pointermove', onMove);
   el.addEventListener('pointerup', onUp);
@@ -54,6 +59,7 @@ export function setTool(name) {
   commitText();
   if (tools.current === name) return;
   if (crop.active && name !== 'crop') endCrop(false);
+  if (tools.current === 'cut') clearCut();
   tools.current = name;
   if (name === 'crop') beginCrop();
   onToolChange(name);
@@ -112,7 +118,11 @@ function onDown(e) {
   el.setPointerCapture(e.pointerId);
   pointers.set(e.pointerId, localPoint(e));
 
-  if (pointers.size === 2) { startPinch(); drag = null; return; }
+  if (pointers.size === 2) {
+    // A second finger means zoom, not a half-drawn lasso.
+    if (drag?.kind === 'lasso') clearCut();
+    startPinch(); drag = null; return;
+  }
   if (pointers.size > 2) return;
 
   const p = localPoint(e);
@@ -132,6 +142,7 @@ function onDown(e) {
     case 'draw': case 'erase': return startPaint(d, e);
     case 'rect': case 'ellipse': case 'line': return startShape(d, e);
     case 'text': return startText(d);
+    case 'cut': return startLasso(p, d);
     default: return;
   }
 }
@@ -166,6 +177,7 @@ function onMove(e) {
     case 'paint': paintTo(d, e); break;
     case 'shape': shapeTo(d, e); break;
     case 'crop-new': case 'crop-move': case 'crop-handle': cropDragTo(d, e); break;
+    case 'lasso': lassoTo(p, d); break;
   }
   requestRender();
 }
@@ -182,9 +194,17 @@ function onUp(e) {
     }
   }
   if (drag.kind === 'paint' && drag.ctx) drag.ctx.restore();
+  if (drag.kind === 'lasso') {
+    cut.drawing = false;
+    if (cut.points.length < 3) clearCut();
+    emit('cut');
+  }
+  // A tap (no drag) on an object is a request to edit it.
+  const tapped = drag.kind === 'move' && drag.l.x === drag.x0 && drag.l.y === drag.y0 ? drag.l : null;
   drag = null;
   emit('all');
   requestRender();
+  if (tapped) onSelectTap(tapped);
 }
 
 function onWheel(e) {
@@ -613,6 +633,7 @@ function cropDragTo(d, e) {
 
 function drawOverlay(ctx) {
   if (crop.active && crop.rect) return drawCropOverlay(ctx);
+  if (tools.current === 'cut') return drawCutOverlay(ctx);
   const l = selected();
   if (!l || !l.visible || tools.current !== 'select') return;
 
@@ -681,5 +702,184 @@ function drawCropOverlay(ctx) {
     ctx.lineWidth = 1;
     ctx.stroke();
   }
+  ctx.restore();
+}
+
+/* -------------------------------------------------------------- cut out */
+
+const isRaster = (l) => l && l.canvas && l.visible;
+
+function startLasso(p, d) {
+  let target = selected();
+  if (!isRaster(target) || target.locked) {
+    target = null;
+    for (let i = doc.layers.length - 1; i >= 0; i--) {
+      const l = doc.layers[i];
+      if (isRaster(l) && !l.locked && hitLayerAt(l, d)) { target = l; break; }
+    }
+  }
+  if (!target) {
+    toast('Start the outline on a photo or drawing layer.', 'err');
+    return;
+  }
+  if (doc.selection !== target.id) { doc.selection = target.id; emit('layers'); }
+  cut.layerId = target.id;
+  cut.points = [d];
+  cut.drawing = true;
+  drag = { kind: 'lasso', last: p };
+  emit('cut');
+}
+
+function hitLayerAt(l, d) {
+  const q = toLocal(l, d.x, d.y);
+  return q.x >= 0 && q.y >= 0 && q.x <= l.w && q.y <= l.h;
+}
+
+function lassoTo(p, d) {
+  // Thin the path on screen distance so slow fingers don't pile up points.
+  if (Math.hypot(p.x - drag.last.x, p.y - drag.last.y) < 3) return;
+  drag.last = p;
+  cut.points.push(d);
+}
+
+export function clearCut() {
+  cut.points = null;
+  cut.layerId = null;
+  cut.drawing = false;
+  emit('cut');
+  requestRender();
+}
+
+export const cutReady = () => !!(cut.points && cut.points.length >= 3 && !cut.drawing && layerById(cut.layerId));
+
+/**
+ * Apply the lasso to its layer: pixels outside the outline (or inside, in
+ * 'remove' mode) become transparent, then the layer is trimmed to what's left
+ * so it moves and scales as a tidy cut-out.
+ */
+export function applyCut() {
+  const src = layerById(cut.layerId);
+  if (!cutReady() || !src) return clearCut();
+  pushHistory();
+
+  let l = src;
+  if (cut.newLayer) {
+    l = { ...src, id: Math.random().toString(36).slice(2, 10), name: (src.name + ' cut-out').slice(0, 24), canvas: src.canvas, _shared: true };
+    addLayer(l, { above: src.id });
+  }
+
+  const cw = l.canvas.width, ch = l.canvas.height;
+  const sx = cw / l.w, sy = ch / l.h;
+  // Outline in the layer's own pixel space.
+  const pts = cut.points.map((d) => { const q = toLocal(l, d.x, d.y); return { x: q.x * sx, y: q.y * sy }; });
+  const feather = cut.feather * Math.max(sx, sy);
+
+  // Mask: filled outline, softened with a shadow blur (works where ctx.filter doesn't).
+  const mask = makeCanvas(cw, ch);
+  const m = mask.getContext('2d');
+  const trace = () => {
+    m.beginPath();
+    m.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) m.lineTo(pts[i].x, pts[i].y);
+    m.closePath();
+  };
+  if (feather > 0.5) {
+    const off = cw + ch + feather * 4;
+    m.shadowColor = '#000';
+    m.shadowBlur = feather;
+    m.shadowOffsetX = off;
+    m.translate(-off, 0);
+    trace();
+    m.fill();
+    m.setTransform(1, 0, 0, 1, 0, 0);
+    m.shadowColor = 'transparent';
+  } else {
+    trace();
+    m.fill();
+  }
+
+  const out = makeCanvas(cw, ch);
+  const o = out.getContext('2d');
+  o.drawImage(l.canvas, 0, 0);
+  o.globalCompositeOperation = cut.mode === 'remove' ? 'destination-out' : 'destination-in';
+  o.drawImage(mask, 0, 0);
+
+  // Trim to the kept region (keep mode only — removing leaves the frame as is).
+  let box = { x: 0, y: 0, w: cw, h: ch };
+  if (cut.mode !== 'remove') {
+    const pad = Math.ceil(feather * 1.5);
+    const x0 = clamp(Math.floor(Math.min(...pts.map((q) => q.x)) - pad), 0, cw);
+    const y0 = clamp(Math.floor(Math.min(...pts.map((q) => q.y)) - pad), 0, ch);
+    const x1 = clamp(Math.ceil(Math.max(...pts.map((q) => q.x)) + pad), 0, cw);
+    const y1 = clamp(Math.ceil(Math.max(...pts.map((q) => q.y)) + pad), 0, ch);
+    if (x1 - x0 < 1 || y1 - y0 < 1) {
+      toast('The outline missed the layer — nothing to keep.', 'err');
+      if (cut.newLayer) doc.layers.splice(doc.layers.indexOf(l), 1);
+      clearCut();
+      emit('all');
+      return;
+    }
+    box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
+  const trimmed = makeCanvas(box.w, box.h);
+  trimmed.getContext('2d').drawImage(out, box.x, box.y, box.w, box.h, 0, 0, box.w, box.h);
+
+  // Re-place the smaller box so the kept pixels don't move on screen, rotation included.
+  const lw = box.w / sx, lh = box.h / sy;
+  const dx = box.x / sx + lw / 2 - l.w / 2, dy = box.y / sy + lh / 2 - l.h / 2;
+  const cx = l.x + l.w / 2, cy = l.y + l.h / 2;
+  const c = rotatePoint(cx + dx, cy + dy, cx, cy, l.rot);
+  l.canvas = trimmed;
+  l._shared = false;
+  l.w = lw; l.h = lh;
+  l.x = c.x - lw / 2; l.y = c.y - lh / 2;
+
+  doc.selection = l.id;
+  clearCut();
+  setTool('select');
+  toast('Cut out. Drag it into place — add more photos with Image to build a collage.', 'ok');
+  emit('all');
+  requestRender();
+}
+
+function drawCutOverlay(ctx) {
+  const l = layerById(cut.layerId) || (isRaster(selected()) ? selected() : null);
+  ctx.save();
+  if (l) {
+    const c = layerCorners(l).map((q) => toScreen(q.x, q.y));
+    ctx.setLineDash([5, 4]);
+    ctx.strokeStyle = 'rgba(124,156,255,.8)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    c.forEach((q, i) => (i ? ctx.lineTo(q.x, q.y) : ctx.moveTo(q.x, q.y)));
+    ctx.closePath();
+    ctx.stroke();
+  }
+  if (!cut.points || cut.points.length < 2) return ctx.restore();
+
+  const pts = cut.points.map((d) => toScreen(d.x, d.y));
+  const trace = () => {
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+  };
+  if (!cut.drawing) {
+    // Preview what goes away.
+    ctx.setLineDash([]);
+    ctx.fillStyle = 'rgba(8,10,15,.6)';
+    ctx.beginPath();
+    if (cut.mode === 'remove') trace();
+    else { ctx.rect(0, 0, ctx.canvas.width, ctx.canvas.height); trace(); }
+    ctx.fill('evenodd');
+  }
+  ctx.lineWidth = 2;
+  ctx.lineJoin = 'round';
+  ctx.setLineDash([]);
+  ctx.strokeStyle = '#000';
+  ctx.beginPath(); trace(); ctx.stroke();
+  ctx.setLineDash([6, 5]);
+  ctx.strokeStyle = '#fff';
+  ctx.beginPath(); trace(); ctx.stroke();
   ctx.restore();
 }

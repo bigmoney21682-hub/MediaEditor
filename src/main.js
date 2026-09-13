@@ -4,7 +4,7 @@ import {
   pushHistory, undo, redo, canUndo, canRedo, selected, removeLayer, clearHistory, moveLayer
 } from './state.js';
 import { attach, requestRender, fitView, zoomAt, stageSize, drawLayer, renderDoc } from './render.js';
-import { initTools, setTool, tools, crop, endCrop, beginCrop, commitText } from './tools.js';
+import { initTools, setTool, tools, crop, endCrop, beginCrop, commitText, cut, cutReady, applyCut, clearCut } from './tools.js';
 import { renderAll, renderToolOptions, renderLayers, renderLayerOptions, setPlaceHandler, setLayerDrawer } from './ui/panels.js';
 import { openAgeDialog } from './ui/agedialog.js';
 import { openExportDialog } from './ui/exportdialog.js';
@@ -16,7 +16,16 @@ const canvas = $('canvas');
 
 attach(canvas);
 setLayerDrawer(drawLayer);
-initTools(canvas, { onToolChange: syncToolButtons });
+initTools(canvas, { onToolChange: syncToolButtons, onSelectTap: () => showPanels() });
+
+/* ----------------------------------------------- phone: slide-over options */
+
+// On a phone the options live in a sheet over the canvas. It opens when you
+// pick a tool or tap an object, and gets out of the way when you work on the canvas.
+const narrow = window.matchMedia('(max-width: 860px)');
+const panels = $('panels');
+function showPanels() { if (narrow.matches) panels.classList.add('open'); }
+function hidePanels() { panels.classList.remove('open'); }
 
 /* ------------------------------------------------------------ doc loading */
 
@@ -100,7 +109,8 @@ $('btn-undo').addEventListener('click', () => { undo(); requestRender(); });
 $('btn-redo').addEventListener('click', () => { redo(); requestRender(); });
 $('btn-age').addEventListener('click', () => { commitText(); openAgeDialog(); });
 $('btn-export').addEventListener('click', () => { commitText(); openExportDialog(); });
-$('btn-menu').addEventListener('click', () => $('panels').classList.toggle('open'));
+$('btn-menu').addEventListener('click', () => panels.classList.toggle('open'));
+$('btn-panels-close').addEventListener('click', hidePanels);
 $('btn-add-layer').addEventListener('click', () => {
   if (!doc.loaded) return toast('Open a photo first.', 'err');
   pushHistory();
@@ -110,17 +120,25 @@ $('btn-add-layer').addEventListener('click', () => {
 });
 
 for (const b of document.querySelectorAll('.tool')) {
-  b.addEventListener('click', () => setTool(b.dataset.tool));
+  b.addEventListener('click', () => {
+    // Tapping the active tool again toggles its options away.
+    if (narrow.matches && tools.current === b.dataset.tool && panels.classList.contains('open')) return hidePanels();
+    setTool(b.dataset.tool);
+    showPanels();
+  });
 }
 function syncToolButtons(name) {
   for (const b of document.querySelectorAll('.tool')) b.classList.toggle('active', b.dataset.tool === name);
   $('crop-actions').hidden = !crop.active;
+  $('cut-actions').hidden = !cutReady();
   renderToolOptions();
 }
 syncToolButtons(tools.current);
 
 $('crop-apply').addEventListener('click', () => { endCrop(true); setTool('select'); fitView(); });
 $('crop-cancel').addEventListener('click', () => { endCrop(false); setTool('select'); });
+$('cut-apply').addEventListener('click', () => applyCut());
+$('cut-cancel').addEventListener('click', () => clearCut());
 
 /* ------------------------------------------------------------------ zoom */
 
@@ -138,6 +156,8 @@ $('zoom-fit').addEventListener('click', () => { fitView(); requestRender(); emit
 
 const dz = $('dropzone');
 const stage = $('stage');
+// Touching the canvas means "back to work": the options sheet steps aside.
+canvas.addEventListener('pointerdown', () => { if (narrow.matches) hidePanels(); });
 ['dragenter', 'dragover'].forEach((ev) =>
   stage.addEventListener(ev, (e) => {
     e.preventDefault();
@@ -169,7 +189,7 @@ window.addEventListener('paste', (e) => {
 
 /* -------------------------------------------------------------- shortcuts */
 
-const TOOL_KEYS = { v: 'select', c: 'crop', b: 'draw', e: 'erase', r: 'rect', o: 'ellipse', l: 'line', t: 'text', i: 'place' };
+const TOOL_KEYS = { v: 'select', c: 'crop', b: 'draw', e: 'erase', r: 'rect', o: 'ellipse', l: 'line', t: 'text', x: 'cut', i: 'place' };
 
 window.addEventListener('keydown', (e) => {
   const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName) || e.target.isContentEditable;
@@ -193,6 +213,11 @@ window.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); endCrop(true); setTool('select'); fitView(); requestRender(); }
     if (e.key === 'Escape') { e.preventDefault(); endCrop(false); setTool('select'); }
     return;
+  }
+
+  if (tools.current === 'cut' && cut.points) {
+    if (e.key === 'Enter' && cutReady()) { e.preventDefault(); applyCut(); return; }
+    if (e.key === 'Escape') { e.preventDefault(); clearCut(); return; }
   }
 
   if ((e.key === 'Delete' || e.key === 'Backspace') && selected()) {
@@ -230,8 +255,9 @@ onChange((what) => {
   $('btn-redo').disabled = !canRedo();
   $('zoom-label').textContent = Math.round(view.zoom * 100) + '%';
   $('crop-actions').hidden = !crop.active;
+  $('cut-actions').hidden = !cutReady();
   if (what === 'view') return;
-  if (what === 'crop') { renderToolOptions(); return; }
+  if (what === 'crop' || what === 'cut') { renderToolOptions(); return; }
   if (what === 'layers') { renderLayers(); renderLayerOptions(); return; }
   renderAll();
 });

@@ -3,7 +3,7 @@ import {
   addLayer, makeDrawLayer, beforePixels
 } from '../state.js';
 import { requestRender, measureText } from '../render.js';
-import { tools, setTool, crop, setCropAspect, endCrop, editText } from '../tools.js';
+import { tools, setTool, crop, setCropAspect, endCrop, editText, cut, cutReady, applyCut, clearCut } from '../tools.js';
 import { el, row, slider, segmented } from './modal.js';
 import { copyCanvas, makeCanvas, toast } from '../util.js';
 
@@ -118,6 +118,23 @@ export function renderToolOptions() {
     host.append(row('Outline', outline));
     host.append(slider('Outline w', { min: 0, max: 24, value: tx.strokeWidth, format: (v) => v + 'px', onInput: (v) => (tx.strokeWidth = v) }));
     host.append(el('div', { class: 'hint' }, 'Click the canvas to place text. Double-click any text to edit it.'));
+    return;
+  }
+
+  if (t === 'cut') {
+    host.append(row('Keep', segmented([['keep', 'Inside'], ['remove', 'Outside']], cut.mode, (v) => { cut.mode = v; requestRender(); })));
+    host.append(slider('Soft edge', { min: 0, max: 30, value: cut.feather, format: (v) => v + 'px', onInput: (v) => (cut.feather = v) }));
+    const copy = el('input', { type: 'checkbox' });
+    copy.checked = cut.newLayer;
+    copy.addEventListener('change', () => (cut.newLayer = copy.checked));
+    host.append(row('Copy', copy, el('span', { class: 'hint' }, 'cut to a new layer, keep original')));
+    if (cutReady()) {
+      host.append(el('div', { class: 'chips', style: { margin: '4px 0 8px' } },
+        el('button', { class: 'btn primary', onclick: () => applyCut() }, '✂ Cut'),
+        el('button', { class: 'btn', onclick: () => clearCut() }, 'Redraw')));
+    }
+    host.append(el('div', { class: 'hint' },
+      'Trace around the person or object with your finger — the outline closes itself. Then press Cut: everything else becomes transparent and the layer shrinks to fit. For a collage, open a background, add photos with Image, and cut each one out.'));
     return;
   }
 

@@ -38,7 +38,8 @@ h2, h3 { margin: 0; font-weight: 600; }
 
 /* ---------- top bar ---------- */
 .topbar {
-  height: var(--topbar-h);
+  /* border-box: the notch inset must add to the bar, not eat into it */
+  height: calc(var(--topbar-h) + env(safe-area-inset-top));
   flex: none;
   display: flex; align-items: center; gap: 12px;
   padding: 0 12px;
@@ -79,7 +80,7 @@ h2, h3 { margin: 0; font-weight: 600; }
 .link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-decoration: underline; }
 
 /* ---------- layout ---------- */
-.body { flex: 1; display: flex; min-height: 0; }
+.body { flex: 1; display: flex; min-height: 0; position: relative; }
 
 .tools {
   width: var(--tools-w); flex: none;
@@ -223,8 +224,8 @@ h2, h3 { margin: 0; font-weight: 600; }
 .modal header h2 { font-size: 15px; }
 .modal .content { padding: 14px 16px; overflow-y: auto; }
 .modal footer {
-  display: flex; gap: 8px; justify-content: flex-end;
-  padding: 12px 16px; border-top: 1px solid var(--line); background: rgba(0,0,0,.15);
+  display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: rgba(0,0,0,.15);
 }
 .modal .x { background: none; border: 0; font-size: 19px; cursor: pointer; color: var(--fg-mute); line-height: 1; }
 .modal .x:hover { color: var(--fg); }
@@ -276,11 +277,26 @@ h2, h3 { margin: 0; font-weight: 600; }
   .tool em { display: none; }
   .tool span { font-size: 19px; }
   .only-narrow { display: inline-flex; }
+  /* Slide-over sheet inside .body, so it always ends where the app does and
+     scrolls as one column instead of clipping its lower sections. */
   .panels {
-    position: absolute; right: 0; top: var(--topbar-h); bottom: 0; z-index: 20;
-    box-shadow: var(--shadow); transform: translateX(100%); transition: transform .18s ease;
+    position: absolute; right: 0; top: 0; bottom: 0; z-index: 20;
+    width: min(320px, calc(100% - var(--tools-w)));
+    overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+    padding-bottom: env(safe-area-inset-bottom);
+    box-shadow: var(--shadow); transform: translateX(105%); transition: transform .18s ease, visibility .18s;
+    visibility: hidden;
   }
-  .panels.open { transform: none; }
+  .panels.open { transform: none; visibility: visible; }
+  .panel, .panel.grow { flex: none; min-height: 0; }
+  .topbar { gap: 8px; padding-left: 10px; padding-right: 10px; }
+  .topbar-actions { gap: 6px; min-width: 0; }
+  #panel-layer, #panel-options { max-height: none; overflow: visible; }
+  .layers { max-height: 34dvh; flex: none; }
+  .row input[type=range] { height: 28px; }
+  .zoombar { bottom: calc(12px + env(safe-area-inset-bottom)); }
+  /* the zoom bar owns the bottom-left corner on a phone; keep action bars clear of it */
+  .crop-actions { top: 12px; bottom: auto; }
   #btn-age { font-size: 0; padding: 6px 9px; }
   #btn-age::before { content: "🕰"; font-size: 14px; }
 }

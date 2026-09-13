@@ -21,13 +21,34 @@ export function flatten({ scale = 1, format = 'png', bg = '#ffffff' } = {}) {
   return renderDoc({ scale, background: needsBg ? bg : null });
 }
 
-export async function exportRaster({ format = 'png', scale = 1, quality = 0.92, bg = '#ffffff', name }) {
+export async function encodeRaster({ format = 'png', scale = 1, quality = 0.92, bg = '#ffffff', name }) {
   const f = RASTER[format];
   if (!f) throw new Error('Unknown format: ' + format);
   const canvas = flatten({ scale, format, bg });
   const blob = await canvasToBlob(canvas, f.mime, f.mime === 'image/png' ? undefined : quality);
-  download(blob, `${name || 'mediaeditor-' + stamp()}.${f.ext}`);
-  return blob;
+  return new File([blob], `${name || 'mediaeditor-' + stamp()}.${f.ext}`, { type: f.mime });
+}
+
+export async function exportRaster(opts) {
+  const file = await encodeRaster(opts);
+  download(file, file.name);
+  return file;
+}
+
+/** True when the OS share sheet can take image files (iOS/Android → "Save Image" to Photos). */
+export function canShareImages() {
+  try {
+    return !!navigator.canShare?.({ files: [new File([''], 'probe.png', { type: 'image/png' })] });
+  } catch { return false; }
+}
+
+/**
+ * Hand an encoded image to the share sheet, where "Save Image" puts it in the
+ * camera roll. Must run close to a tap: browsers refuse share() once the
+ * gesture has gone stale, which surfaces as NotAllowedError.
+ */
+export async function shareImage(file) {
+  await navigator.share({ files: [file] });
 }
 
 /* -------------------------------------------------------------------- PDF */

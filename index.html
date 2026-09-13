@@ -11,7 +11,7 @@
 <body>
 <div id="app">
   <header class="topbar">
-    <div class="brand"><span class="dot"></span> MediaEditor</div>
+    <div class="brand"><span class="dot"></span><span>MediaEditor</span></div>
     <div class="topbar-actions">
       <button id="btn-open" class="btn">Open</button>
       <button id="btn-undo" class="btn icon" title="Undo (⌘Z)" disabled>↶</button>
@@ -33,6 +33,7 @@
       <button class="tool" data-tool="ellipse" title="Ellipse (O)"><span>◯</span><em>Ellipse</em></button>
       <button class="tool" data-tool="line" title="Line / arrow (L)"><span>╱</span><em>Line</em></button>
       <button class="tool" data-tool="text" title="Text (T)"><span>T</span><em>Text</em></button>
+      <button class="tool" data-tool="cut" title="Cut out — lasso what to keep (X)"><span>✂</span><em>Cut</em></button>
       <button class="tool" data-tool="place" title="Place image (I)"><span>🖼</span><em>Image</em></button>
     </nav>
 
@@ -56,11 +57,15 @@
         <button class="btn" id="crop-cancel">Cancel</button>
         <button class="btn primary" id="crop-apply">Apply crop</button>
       </div>
+      <div class="crop-actions" id="cut-actions" hidden>
+        <button class="btn" id="cut-cancel">Cancel</button>
+        <button class="btn primary" id="cut-apply">✂ Cut</button>
+      </div>
     </main>
 
     <aside class="panels" id="panels" aria-label="Options">
       <section class="panel" id="panel-options">
-        <h3>Tool</h3>
+        <h3>Tool <button class="btn tiny only-narrow" id="btn-panels-close" title="Hide panel">✕</button></h3>
         <div id="tool-options"></div>
       </section>
       <section class="panel grow">
